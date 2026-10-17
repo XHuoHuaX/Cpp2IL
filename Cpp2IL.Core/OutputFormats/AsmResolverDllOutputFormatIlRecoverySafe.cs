@@ -1,14 +1,17 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.OutputFormats;
 
@@ -36,6 +39,13 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     private readonly ConcurrentDictionary<string, int[]> _perAssembly = new();
     private readonly ConcurrentBag<string> _issues = new(); // "reason\tassembly\tmethod\tdetail"
     private int _clean, _placeholder, _exception, _skipped;
+
+    // ---- address diagnostics: is a "Unmanaged memory load: [ADDR]" address a real metadata-usage slot? ----
+    private static readonly Regex BracketHex = new(@"\[([0-9A-Fa-f]+)\]", RegexOptions.Compiled);
+    private readonly ConcurrentDictionary<long, int> _addrDelta = new(); // (addr - nearestSlot) -> count
+    private long _addrHit, _addrMiss, _addrNoSlotSet;
+    private ulong[]? _slotAddrs;
+    private readonly object _slotLock = new();
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
@@ -78,10 +88,103 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             SuccessfulMethodCount--;
             FillMethodBodyWithStub(methodDefinition);
             Interlocked.Increment(ref _placeholder);
+            AnalyzePlaceholderAddress(methodContext, detail);
         }
         else
         {
             Interlocked.Increment(ref _exception);
+        }
+    }
+
+    /// <summary>
+    /// For a "Unmanaged memory load: [ADDR]" placeholder, checks whether ADDR really is a metadata-usage
+    /// global slot address. If not, it records the delta to the nearest real slot address, so a systematic
+    /// address miscomputation (e.g. an ADRP page added twice) shows up as a tight, page-aligned delta.
+    /// </summary>
+    private void AnalyzePlaceholderAddress(MethodAnalysisContext methodContext, string detail)
+    {
+        var match = BracketHex.Match(detail);
+        if (!match.Success)
+            return;
+        if (!ulong.TryParse(match.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address))
+            return;
+
+        var lib = methodContext.AppContext.LibCpp2IlContext;
+
+        if (lib.GetAnyGlobalByAddress(address) != null)
+        {
+            Interlocked.Increment(ref _addrHit);
+            return;
+        }
+
+        Interlocked.Increment(ref _addrMiss);
+
+        var slots = GetSlotAddresses(lib);
+        if (slots.Length == 0)
+        {
+            Interlocked.Increment(ref _addrNoSlotSet);
+            return;
+        }
+
+        // binary search for the nearest slot address
+        var idx = Array.BinarySearch(slots, address);
+        if (idx < 0)
+            idx = ~idx;
+
+        var best = long.MaxValue;
+        if (idx < slots.Length)
+            best = Math.Min(best, Math.Abs((long)slots[idx] - (long)address));
+        if (idx > 0)
+            best = Math.Min(best, Math.Abs((long)slots[idx - 1] - (long)address));
+
+        // keep the sign so an "address too large" artefact is distinguishable from "too small"
+        var signedBest = idx < slots.Length && (idx == 0 || Math.Abs((long)slots[idx] - (long)address) <= Math.Abs((long)slots[idx - 1] - (long)address))
+            ? (long)address - (long)slots[idx]
+            : (long)address - (long)slots[idx - 1];
+
+        _addrDelta.AddOrUpdate(signedBest, 1, (_, n) => n + 1);
+    }
+
+    /// <summary>All metadata-usage global slot addresses known from the metadata (pre-27 path).</summary>
+    private ulong[] GetSlotAddresses(LibCpp2IlContext lib)
+    {
+        if (_slotAddrs != null)
+            return _slotAddrs;
+
+        lock (_slotLock)
+        {
+            if (_slotAddrs != null)
+                return _slotAddrs;
+
+            var set = new SortedSet<ulong>();
+            try
+            {
+                var dic = lib.Metadata.metadataUsageDic;
+                if (dic != null)
+                {
+                    foreach (var perType in dic.Values)
+                    {
+                        foreach (var index in perType.Keys)
+                        {
+                            try
+                            {
+                                set.Add(lib.Binary.GetRawMetadataUsage(index));
+                            }
+                            catch
+                            {
+                                // out-of-range usage index - ignore
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.WarnNewline($"[IlRecoverySafe] could not enumerate metadata-usage slots: {e.Message}", "IlRecoverySafe");
+            }
+
+            _slotAddrs = set.ToArray();
+            return _slotAddrs;
         }
     }
 
@@ -162,6 +265,8 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
             Logger.InfoNewline($"[IlRecoverySafe] summary: {summary}", "IlRecoverySafe");
             Logger.InfoNewline($"[IlRecoverySafe] issues : {issuesPath}", "IlRecoverySafe");
+
+            ReportAddressDiagnostics(root);
         }
         catch (Exception e)
         {
@@ -169,5 +274,40 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         }
 
         return ret;
+    }
+
+    private void ReportAddressDiagnostics(string root)
+    {
+        var hit = Interlocked.Read(ref _addrHit);
+        var miss = Interlocked.Read(ref _addrMiss);
+        var noSet = Interlocked.Read(ref _addrNoSlotSet);
+        Logger.InfoNewline(
+            $"[IlRecoverySafe][addr] bracketed-address placeholders: hit={hit}, miss={miss}, noSlotSet={noSet} " +
+            $"(slotAddresses={_slotAddrs?.Length ?? 0})",
+            "IlRecoverySafe");
+
+        var top = _addrDelta.OrderByDescending(kv => kv.Value).Take(20).ToList();
+        if (top.Count == 0)
+            return;
+
+        var lines = new List<string> { "delta_to_nearest_slot\tcount\tpage_aligned" };
+        foreach (var (delta, count) in top)
+        {
+            var aligned = delta != 0 && delta % 0x1000 == 0;
+            lines.Add($"{(delta < 0 ? "-" : "+")}0x{Math.Abs(delta):X}\t{count}\t{aligned}");
+            Logger.InfoNewline($"[IlRecoverySafe][addr] delta={(delta < 0 ? "-" : "+")}0x{Math.Abs(delta):X} " +
+                               $"x{count} pageAligned={aligned}", "IlRecoverySafe");
+        }
+
+        try
+        {
+            var path = Path.Combine(root, "dll_il_recovery_safe.addrtest.tsv");
+            File.WriteAllLines(path, lines);
+            Logger.InfoNewline($"[IlRecoverySafe] addrtest: {path}", "IlRecoverySafe");
+        }
+        catch (Exception e)
+        {
+            Logger.ErrorNewline($"[IlRecoverySafe] failed to write addrtest: {e.Message}", "IlRecoverySafe");
+        }
     }
 }

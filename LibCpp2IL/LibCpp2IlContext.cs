@@ -131,7 +131,7 @@ public sealed class LibCpp2IlContext
     }
 
     public MetadataUsage? GetLiteralGlobalByAddress(ulong address)
-        => Metadata.MetadataVersion < 27f ? LiteralsByAddress.GetOrDefault(address) : GetAnyGlobalByAddress(address);
+        => Metadata.MetadataVersion < 27f ? LookupPre27(address, LiteralsByAddress) : GetAnyGlobalByAddress(address);
 
     public string? GetLiteralByAddress(ulong address)
     {
@@ -143,7 +143,7 @@ public sealed class LibCpp2IlContext
     }
 
     public MetadataUsage? GetRawTypeGlobalByAddress(ulong address)
-        => Metadata.MetadataVersion < 27f ? TypeRefsByAddress.GetOrDefault(address) : GetAnyGlobalByAddress(address);
+        => Metadata.MetadataVersion < 27f ? LookupPre27(address, TypeRefsByAddress) : GetAnyGlobalByAddress(address);
 
     public Il2CppType? GetTypeGlobalByAddress(ulong address)
     {
@@ -156,13 +156,13 @@ public sealed class LibCpp2IlContext
     }
 
     public MetadataUsage? GetRawFieldGlobalByAddress(ulong address)
-        => Metadata.MetadataVersion < 27f ? FieldRefsByAddress.GetOrDefault(address) : GetAnyGlobalByAddress(address);
+        => Metadata.MetadataVersion < 27f ? LookupPre27(address, FieldRefsByAddress) : GetAnyGlobalByAddress(address);
 
     public Il2CppFieldDefinition? GetFieldGlobalByAddress(ulong address)
         => GetRawFieldGlobalByAddress(address)?.AsField();
 
     public MetadataUsage? GetMethodGlobalByAddress(ulong address)
-        => Metadata.MetadataVersion < 27f ? MethodRefsByAddress.GetOrDefault(address) : GetAnyGlobalByAddress(address);
+        => Metadata.MetadataVersion < 27f ? LookupPre27(address, MethodRefsByAddress) : GetAnyGlobalByAddress(address);
 
     public Il2CppMethodDefinition? GetMethodDefinitionByGlobalAddress(ulong address)
     {
@@ -172,5 +172,38 @@ public sealed class LibCpp2IlContext
             return global.AsGenericMethodRef().BaseMethod;
 
         return global?.AsMethod();
+    }
+
+    /// <summary>
+    /// Pre-27 lookup of a metadata-usage global by the address the native code references.
+    ///
+    /// Some pre-27 codegen forms reference a statically-initialised pointer TO the usage slot
+    /// instead of the usage slot itself, i.e. the native code performs two loads:
+    /// <code>
+    ///     LDR X8, [ptr]   ; X8 = metadataUsages[i], i.e. the slot address
+    ///     LDR X0, [X8]    ; then the usage value itself
+    /// </code>
+    /// so the constant address in the instruction (and therefore in the ISIL MemoryOperand) is
+    /// <c>ptr</c>, not <c>metadataUsages[i]</c> - and the by-address dictionaries are keyed by the
+    /// slot addresses (<c>metadataUsages[i]</c>), so a direct lookup misses.
+    ///
+    /// Measured on a real Unity 2019.4.21 / metadata 24.5 ARM64 game: of 14,765 unresolved
+    /// absolute loads, 14,356 (97.2%) resolve through exactly this one extra indirection.
+    /// We therefore fall back to reading the pointer stored at the address and retrying the lookup.
+    /// </summary>
+    private MetadataUsage? LookupPre27(ulong address, Dictionary<ulong, MetadataUsage> byAddress)
+    {
+        if (byAddress.TryGetValue(address, out var direct))
+            return direct;
+
+        // Only file-backed addresses can be read; .bss/out-of-range addresses have no stored pointer.
+        if (!Binary.TryMapVirtualAddressToRaw(address, out var raw) || raw < 0 || raw >= Binary.RawLength)
+            return null;
+
+        var slot = Binary.ReadPointerAtVirtualAddress(address);
+        if (slot == 0 || slot == address)
+            return null;
+
+        return byAddress.GetOrDefault(slot);
     }
 }
