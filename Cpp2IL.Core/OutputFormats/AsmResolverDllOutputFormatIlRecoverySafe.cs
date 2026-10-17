@@ -9,6 +9,7 @@ using System.Threading;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 using LibCpp2IL;
@@ -53,6 +54,8 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     private readonly ConcurrentDictionary<ulong, int> _mnfUnresolved = new(); // unresolved-address -> method count
     private readonly ConcurrentDictionary<ulong, string> _mnfInMba = new(); // addr -> "count\tsample signatures"
     private int _mnfInMethodsByAddress, _mnfInGenericImpl, _mnfInKeyFunctions, _mnfNearKnown, _mnfUnknown;
+    private int _mnfThrowHelperName, _mnfThrowHelperRaiser; // unknown_native split
+    private int _mnfOtherUnknown;
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
@@ -213,6 +216,30 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         Interlocked.Increment(ref _mnfUnknown);
         _mnfClass.AddOrUpdate("unknown_native", 1, (_, n) => n + 1);
         _mnfUnresolved.AddOrUpdate(address, 1, (_, n) => n + 1);
+        ClassifyUnknownNative(app, address);
+    }
+
+    /// <summary>Splits "unknown_native" into (a) throw-helper that names an exception type
+    /// and (b) raiser that throws its argument, matching what ThrowHelperRecovery already
+    /// resolves in MetadataResolver. If neither, keep the generic "unknown_native" label
+    /// but record that it's a runtime helper (not a managed method) so the report can be
+    /// filtered.</summary>
+    private void ClassifyUnknownNative(ApplicationAnalysisContext app, ulong address)
+    {
+        if (ThrowHelperRecovery.GetThrownException(app, address) is not null)
+        {
+            Interlocked.Increment(ref _mnfThrowHelperName);
+            _mnfClass.AddOrUpdate("unknown_throwhelper_named", 1, (_, n) => n + 1);
+            return;
+        }
+        if (ThrowHelperRecovery.IsExceptionRaiser(app, address))
+        {
+            Interlocked.Increment(ref _mnfThrowHelperRaiser);
+            _mnfClass.AddOrUpdate("unknown_throwhelper_raiser", 1, (_, n) => n + 1);
+            return;
+        }
+        Interlocked.Increment(ref _mnfOtherUnknown);
+        _mnfClass.AddOrUpdate("unknown_other_runtime_helper", 1, (_, n) => n + 1);
     }
 
     /// <summary>All metadata-usage global slot addresses known from the metadata (pre-27 path).</summary>
@@ -402,7 +429,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         {
             var lines = new List<string> { "class\tcount" };
             lines.AddRange(_mnfClass.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}\t{kv.Value}"));
-            var topUnresolved = _mnfUnresolved.OrderByDescending(kv => kv.Value).Take(20)
+            var topUnresolved = _mnfUnresolved.OrderByDescending(kv => kv.Value).Take(40)
                 .Select(kv => $"0x{kv.Key:X}\t{kv.Value}");
             lines.AddRange(topUnresolved);
             lines.Add("--- in MethodsByAddress (addr | totalCandidates | sample) ---");

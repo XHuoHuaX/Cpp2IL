@@ -258,6 +258,17 @@ public abstract class BaseKeyFunctionAddresses
             Logger.VerboseNewline($"Found at 0x{il2cpp_codegen_raise_exception:X}");
         }
 
+        if (il2cpp_codegen_raise_exception == 0 && il2cpp_vm_exception_raise != 0)
+        {
+            // IL2CPP also emits a generic thrower helper: a short wrapper whose body ends by BL-ing
+            // vm::Exception::Raise. Method bodies BL that wrapper directly, and the thunk walk above
+            // (FindAllThunkFunctions) can't find it - it isn't a straight B-tail, it has a prologue
+            // and is reached by BL. Register the vm-level raise as the codegen raise: HandleKeyFunction
+            // rewrites every raise-family call to a throw of the exception operand.
+            il2cpp_codegen_raise_exception = il2cpp_vm_exception_raise;
+            Logger.VerboseNewline($"Using vm-level raise as codegen raise fallback at 0x{il2cpp_codegen_raise_exception:X}");
+        }
+
         if (il2cpp_codegen_initialize_runtime_metadata != 0)
         {
             Logger.Verbose("\tLooking for il2cpp_codegen_initialize_runtime_metadata_inline as a thunk of the metadata init...");

@@ -562,7 +562,28 @@ public static class MetadataResolver
 
                 if (hiddenParamIndex >= instruction.Operands.Count
                     || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
+                {
+                    // Fallback: a call to a key function (e.g. il2cpp_codegen_initialize_method) passes its
+                    // hidden MethodInfo argument in x1 (the second register), but that argument often isn't
+                    // typed as a RuntimeMethodInfo yet when we get here. If the argument is a typed local
+                    // whose type is a RuntimeMethodInfo, use the method it represents.
+                    var lastOperand = instruction.Operands[^1];
+                    var rep2 = lastOperand switch
+                    {
+                        RuntimeMethodInfoAnalysisContext mi => mi.RepresentedMethod,
+                        LocalVariable { Type: RuntimeMethodInfoAnalysisContext mi2 } => mi2.RepresentedMethod,
+                        _ => null
+                    };
+
+                    if (rep2 is null
+                        || ReferenceEquals(rep2, method))
+                        continue;
+
+                    instruction.SetOperand(0, rep2);
+                    rep2.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, rep2);
+                    changed = true;
                     continue;
+                }
 
                 instruction.SetOperand(0, representedMethod);
                 representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
