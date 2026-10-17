@@ -232,15 +232,29 @@ public class BinarySearcher(Il2CppBinary binary, Il2CppMetadata metadata, int me
             //...and subtract that from our pointer.
             var address = pCodegenModule - bytesToGoBack;
 
+            //A single candidate is NOT automatically trustworthy. On some heavily-stripped games the
+            //codegen-module xref lands on a struct that merely *looks* like a code registration (its
+            //count fields are garbage), and blindly returning it both crashes later (reading a
+            //hundred-million-entry array) and - worse - prevents the registration fallback locator
+            //(e.g. the StrippedCodeRegSupport plugin, whose hook only fires when cr == null) from
+            //ever being consulted. So validate EVERY candidate, single or not, and reject the bad
+            //ones so the fallback gets its chance.
             if (pCodegenModules.Count == 1)
+                LibLogger.VerboseNewline($"\t\t\tOnly found one codegen module pointer, validating it before use (pCodeReg candidate = 0x{address:X})...");
+            else
+                LibLogger.Verbose($"\t\t\tConsidering potential code registration at 0x{address:X}...");
+
+            Il2CppCodeRegistration codeReg;
+            try
             {
-                LibLogger.VerboseNewline($"\t\t\tOnly found one codegen module pointer, so assuming it's correct and returning pCodeReg = 0x{address:X}");
-                return address;
+                codeReg = binary.ReadReadableAtVirtualAddress<Il2CppCodeRegistration>(address);
             }
-
-            LibLogger.Verbose($"\t\t\tConsidering potential code registration at 0x{address:X}...");
-
-            var codeReg = binary.ReadReadableAtVirtualAddress<Il2CppCodeRegistration>(address);
+            catch (Exception e)
+            {
+                //Unmappable candidate address - reject rather than abort the whole search.
+                LibLogger.VerboseNewline($"\t\t\tRejected candidate at 0x{address:X}: could not read code registration ({e.GetType().Name}).");
+                continue;
+            }
 
             var success = ValidateCodeRegistration(codeReg, fieldsByName, binary);
 
@@ -249,6 +263,9 @@ public class BinarySearcher(Il2CppBinary binary, Il2CppMetadata metadata, int me
                 LibLogger.VerboseNewline("Looks good!");
                 return address;
             }
+
+            if (pCodegenModules.Count == 1)
+                LibLogger.WarnNewline($"\t\t\tThe only code registration candidate at 0x{address:X} failed validation; rejecting it so a fallback locator (plugin) can try.");
         }
 
         return 0;
