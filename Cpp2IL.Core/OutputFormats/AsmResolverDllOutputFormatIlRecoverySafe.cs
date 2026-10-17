@@ -47,6 +47,13 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     private ulong[]? _slotAddrs;
     private readonly object _slotLock = new();
 
+    // ---- "Method not found @ADDR" classification ----
+    private static readonly Regex MethodNotFoundAt = new(@"Method not found @([0-9A-Fa-f]+)", RegexOptions.Compiled);
+    private readonly ConcurrentDictionary<string, int> _mnfClass = new(); // class -> count
+    private readonly ConcurrentDictionary<ulong, int> _mnfUnresolved = new(); // unresolved-address -> method count
+    private readonly ConcurrentDictionary<ulong, string> _mnfInMba = new(); // addr -> "count\tsample signatures"
+    private int _mnfInMethodsByAddress, _mnfInGenericImpl, _mnfInKeyFunctions, _mnfNearKnown, _mnfUnknown;
+
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
         base.FillMethodBody(methodDefinition, methodContext);
@@ -89,6 +96,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             FillMethodBodyWithStub(methodDefinition);
             Interlocked.Increment(ref _placeholder);
             AnalyzePlaceholderAddress(methodContext, detail);
+            AnalyzeMethodNotFound(methodContext, detail);
         }
         else
         {
@@ -143,6 +151,68 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             : (long)address - (long)slots[idx - 1];
 
         _addrDelta.AddOrUpdate(signedBest, 1, (_, n) => n + 1);
+    }
+
+    /// <summary>
+    /// Classifies a "Method not found @ADDR" placeholder: is ADDR actually known somewhere?
+    ///  - MethodsByAddress                           => anomaly: lookup should have succeeded
+    ///  - Binary.ConcreteGenericImplementationsByAddress => generic method impl known but not registered
+    ///  - a key function (runtime internal helper)   => not a managed method; KeyFunctionRecovery gap
+    ///  - within 64 bytes of a MethodsByAddress key  => thunk/veneer offset guess
+    ///  - otherwise                                  => genuinely unknown native target
+    /// </summary>
+    private void AnalyzeMethodNotFound(MethodAnalysisContext methodContext, string detail)
+    {
+        var match = MethodNotFoundAt.Match(detail);
+        if (!match.Success)
+            return;
+        if (!ulong.TryParse(match.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address))
+            return;
+
+        var app = methodContext.AppContext;
+        var keyFuncs = app.GetOrCreateKeyFunctionAddresses();
+
+        if (app.MethodsByAddress.ContainsKey(address))
+        {
+            Interlocked.Increment(ref _mnfInMethodsByAddress);
+            _mnfClass.AddOrUpdate("in_MethodsByAddress_ANOMALY", 1, (_, n) => n + 1);
+            if (app.MethodsByAddress.TryGetValue(address, out var list))
+            {
+                var sample = string.Join(" | ", list.Take(3).Select(m => m.FullNameWithSignature));
+                _mnfInMba.AddOrUpdate(address, $"{list.Count}\t{sample}", (_, old) =>
+                {
+                    var c = int.Parse(old.Split('\t')[0]);
+                    return $"{c + list.Count}\t{sample}";
+                });
+            }
+            return;
+        }
+
+        if (app.Binary.ConcreteGenericImplementationsByAddress.ContainsKey(address))
+        {
+            Interlocked.Increment(ref _mnfInGenericImpl);
+            _mnfClass.AddOrUpdate("in_ConcreteGenericImpl_but_not_registered", 1, (_, n) => n + 1);
+            return;
+        }
+
+        if (keyFuncs.IsKeyFunctionAddress(address))
+        {
+            Interlocked.Increment(ref _mnfInKeyFunctions);
+            _mnfClass.AddOrUpdate("key_function_runtime_helper", 1, (_, n) => n + 1);
+            return;
+        }
+
+        var nearKnown = app.MethodsByAddress.Keys.Any(k => Math.Abs((long)k - (long)address) <= 64);
+        if (nearKnown)
+        {
+            Interlocked.Increment(ref _mnfNearKnown);
+            _mnfClass.AddOrUpdate("within_64B_of_known_method", 1, (_, n) => n + 1);
+            return;
+        }
+
+        Interlocked.Increment(ref _mnfUnknown);
+        _mnfClass.AddOrUpdate("unknown_native", 1, (_, n) => n + 1);
+        _mnfUnresolved.AddOrUpdate(address, 1, (_, n) => n + 1);
     }
 
     /// <summary>All metadata-usage global slot addresses known from the metadata (pre-27 path).</summary>
@@ -308,6 +378,43 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         catch (Exception e)
         {
             Logger.ErrorNewline($"[IlRecoverySafe] failed to write addrtest: {e.Message}", "IlRecoverySafe");
+        }
+
+        ReportMethodNotFoundDiagnostics(root);
+    }
+
+    private void ReportMethodNotFoundDiagnostics(string root)
+    {
+        var mb = Volatile.Read(ref _mnfInMethodsByAddress);
+        var gi = Volatile.Read(ref _mnfInGenericImpl);
+        var kf = Volatile.Read(ref _mnfInKeyFunctions);
+        var nk = Volatile.Read(ref _mnfNearKnown);
+        var uk = Volatile.Read(ref _mnfUnknown);
+        Logger.InfoNewline(
+            $"[IlRecoverySafe][mnf] Method-not-found totals: inMethodsByAddress={mb}, " +
+            $"genericKnownButNotRegistered={gi}, keyFunction={kf}, nearKnown={nk}, unknown={uk}",
+            "IlRecoverySafe");
+
+        foreach (var (cls, count) in _mnfClass.OrderByDescending(kv => kv.Value))
+            Logger.InfoNewline($"[IlRecoverySafe][mnf]   {cls}: {count}", "IlRecoverySafe");
+
+        try
+        {
+            var lines = new List<string> { "class\tcount" };
+            lines.AddRange(_mnfClass.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}\t{kv.Value}"));
+            var topUnresolved = _mnfUnresolved.OrderByDescending(kv => kv.Value).Take(20)
+                .Select(kv => $"0x{kv.Key:X}\t{kv.Value}");
+            lines.AddRange(topUnresolved);
+            lines.Add("--- in MethodsByAddress (addr | totalCandidates | sample) ---");
+            lines.AddRange(_mnfInMba.OrderByDescending(kv => int.Parse(kv.Value.Split('\t')[0])).Take(15)
+                .Select(kv => $"0x{kv.Key:X}\t{kv.Value}"));
+            var path = Path.Combine(root, "dll_il_recovery_safe.mnfclassify.tsv");
+            File.WriteAllLines(path, lines);
+            Logger.InfoNewline($"[IlRecoverySafe] mnfclassify: {path}", "IlRecoverySafe");
+        }
+        catch (Exception e)
+        {
+            Logger.ErrorNewline($"[IlRecoverySafe] failed to write mnfclassify: {e.Message}", "IlRecoverySafe");
         }
     }
 }

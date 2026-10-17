@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Extensions;
@@ -307,6 +308,20 @@ public static class MetadataResolver
                 continue;
             }
 
+            // Shared generic bodies: IL2CPP emits ONE native body for an open generic method and shares
+            // it across every concrete instantiation (List<T>::.ctor, Component::GetComponent<T>, ...).
+            // When ALL candidates are instantiations of the same base method, the call can't be
+            // disambiguated to a concrete instance, and picking one would silently bind the wrong
+            // generic arguments. The faithful choice is the open generic representative: keep the
+            // method generic and let the (often still-passed) hidden MethodInfo carry the runtime type.
+            if (ShareBodyViaOpenGeneric(candidates, out var openGeneric))
+            {
+                instruction.SetOperand(0, openGeneric);
+                openGeneric.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, openGeneric);
+                changed = true;
+                continue;
+            }
+
             if (GetReceiver(instruction) is not { Type: { } receiverType } receiver)
                 continue;
 
@@ -365,6 +380,31 @@ public static class MetadataResolver
     // Prefer operators if possible
     private static MethodAnalysisContext PreferredOf(List<MethodAnalysisContext> candidates) =>
         candidates.FirstOrDefault(c => c.Name.StartsWith("op_")) ?? candidates[0];
+
+    /// <summary>
+    /// True when every candidate in <paramref name="candidates"/> is an instantiation of the same
+    /// base method (a shared generic body), and <paramref name="representative"/> is the open generic
+    /// member to call instead. The representative prefers the non-instantiated base method so the
+    /// emitted C# stays generic rather than hard-coding one concrete instantiation's type arguments.
+    /// </summary>
+    private static bool ShareBodyViaOpenGeneric(List<MethodAnalysisContext> candidates, [NotNullWhen(true)] out MethodAnalysisContext? representative)
+    {
+        var first = candidates[0];
+        var anchor = first is ConcreteGenericMethodAnalysisContext concrete ? concrete.BaseMethodContext : first;
+
+        // Every candidate must be the same base method; otherwise the bodies may differ and this is
+        // a real ambiguity, not a shared generic body.
+        if (!candidates.All(c => (c is ConcreteGenericMethodAnalysisContext c2 ? c2.BaseMethodContext : c) is var baseC && ReferenceEquals(baseC, anchor)))
+        {
+            representative = null;
+            return false;
+        }
+
+        // Prefer the open generic (a plain MethodAnalysisContext that IS the base method) so the emitted
+        // call stays generic; fall back to the base method itself when only instantiations are present.
+        representative = candidates.FirstOrDefault(c => ReferenceEquals(c, anchor)) ?? anchor;
+        return true;
+    }
 
     // The receiver ('this') of a call is the first integer-slot argument: operand 1 for CallVoid
     // (after the target), operand 2 for Call (after the target and the return value).
