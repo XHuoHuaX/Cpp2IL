@@ -57,53 +57,75 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     private int _mnfThrowHelperName, _mnfThrowHelperRaiser; // unknown_native split
     private int _mnfOtherUnknown;
 
+    // ---- untyped-base provenance: WHY does [ vN @ XREG+off ] have no type on its base? ----
+    // Matches both "Unmanaged memory load: [v45 @ X0_v2+12F]" and the typed variant
+    // "Unmanaged memory load: [v45 @ X0_v2 (Il2CppClass<...>)+128]" (group 3 = optional type).
+    private static readonly Regex UntypedMemLoad = new(
+        @"Unmanaged memory load: \[(\S+) @ ([^\s(]+)(?: \(([^)]*)\))?\+([0-9A-F]+)\]$", RegexOptions.Compiled);
+    private readonly ConcurrentDictionary<string, int> _ubChain = new(); // provenance chain -> count
+    private readonly ConcurrentDictionary<string, int> _ubConstAddr = new(); // terminal const addr -> count
+    private readonly ConcurrentDictionary<string, int> _ubConstAddrKnown = new(); // of the above: known metadata global?
+    private int _ubTotal, _ubConstTotal, _ubConstKnownTotal;
+
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
-        base.FillMethodBody(methodDefinition, methodContext);
-
-        var assemblyName = methodContext.DeclaringType?.DeclaringAssembly?.Name ?? "?";
-        var slot = _perAssembly.GetOrAdd(assemblyName, _ => new int[4]);
-
-        if (methodDefinition.CilMethodBody is not { } body || body.Instructions.Count == 0)
+        // The base releases ISIL/CFG at the end of its FillMethodBody. Because our diagnostics need
+        // the CFG (to walk a placeholder's operand provenance), BuildAssemblies defers that release
+        // and we drop it here in a finally - retention stays bounded to one method at a time.
+        try
         {
-            Interlocked.Increment(ref slot[3]);
-            Interlocked.Increment(ref _skipped);
-            return;
+            base.FillMethodBody(methodDefinition, methodContext);
+
+            var assemblyName = methodContext.DeclaringType?.DeclaringAssembly?.Name ?? "?";
+            var slot = _perAssembly.GetOrAdd(assemblyName, _ => new int[4]);
+
+            if (methodDefinition.CilMethodBody is not { } body || body.Instructions.Count == 0)
+            {
+                Interlocked.Increment(ref slot[3]);
+                Interlocked.Increment(ref _skipped);
+                return;
+            }
+
+            // Engine/BCL assemblies are deliberately stubbed by the base class; don't count them as IR gaps.
+            if (IsSkippedAssembly(methodDefinition))
+            {
+                Interlocked.Increment(ref slot[3]);
+                Interlocked.Increment(ref _skipped);
+                return;
+            }
+
+            var (reason, detail) = FindIssue(body);
+
+            if (reason == null)
+            {
+                Interlocked.Increment(ref slot[0]);
+                Interlocked.Increment(ref _clean);
+                return;
+            }
+
+            Interlocked.Increment(ref slot[reason == "placeholder" ? 1 : 2]);
+            _issues.Add($"{reason}\t{assemblyName}\t{methodContext.FullName}\t{Flatten(detail)}");
+
+            if (reason == "placeholder")
+            {
+                // Safe mode: base counted this as a successful decompile; it is not - it would silently
+                // carry fake values. Replace the whole body with a minimal implementation.
+                SuccessfulMethodCount--;
+                FillMethodBodyWithStub(methodDefinition);
+                Interlocked.Increment(ref _placeholder);
+                AnalyzePlaceholderAddress(methodContext, detail);
+                AnalyzeMethodNotFound(methodContext, detail);
+                AnalyzeUntypedBase(methodContext, detail);
+            }
+            else
+            {
+                Interlocked.Increment(ref _exception);
+            }
         }
-
-        // Engine/BCL assemblies are deliberately stubbed by the base class; don't count them as IR gaps.
-        if (IsSkippedAssembly(methodDefinition))
+        finally
         {
-            Interlocked.Increment(ref slot[3]);
-            Interlocked.Increment(ref _skipped);
-            return;
-        }
-
-        var (reason, detail) = FindIssue(body);
-
-        if (reason == null)
-        {
-            Interlocked.Increment(ref slot[0]);
-            Interlocked.Increment(ref _clean);
-            return;
-        }
-
-        Interlocked.Increment(ref slot[reason == "placeholder" ? 1 : 2]);
-        _issues.Add($"{reason}\t{assemblyName}\t{methodContext.FullName}\t{Flatten(detail)}");
-
-        if (reason == "placeholder")
-        {
-            // Safe mode: base counted this as a successful decompile; it is not - it would silently
-            // carry fake values. Replace the whole body with a minimal implementation.
-            SuccessfulMethodCount--;
-            FillMethodBodyWithStub(methodDefinition);
-            Interlocked.Increment(ref _placeholder);
-            AnalyzePlaceholderAddress(methodContext, detail);
-            AnalyzeMethodNotFound(methodContext, detail);
-        }
-        else
-        {
-            Interlocked.Increment(ref _exception);
+            // Drop the ISIL/CFG that BuildAssemblies asked the base to defer.
+            methodContext.ReleaseAnalysisDataNow();
         }
     }
 
@@ -242,6 +264,135 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         _mnfClass.AddOrUpdate("unknown_other_runtime_helper", 1, (_, n) => n + 1);
     }
 
+    /// <summary>
+    /// For a memory-load placeholder whose base local has NO type, walks the def chain of that base
+    /// (up to 4 hops) and records a provenance signature, so the family can be split into actionable
+    /// root causes: "loaded from a metadata global we DID resolve" vs "from a global we never
+    /// resolved" vs "call result" vs "copy/phi", etc.
+    /// </summary>
+    private void AnalyzeUntypedBase(MethodAnalysisContext methodContext, string detail)
+    {
+        var match = UntypedMemLoad.Match(detail);
+        if (!match.Success)
+            return;
+
+        // Group 3 present => the base carries a type: that is the other family (offset resolution).
+        if (match.Groups[3].Success && match.Groups[3].Value.Length > 0)
+            return;
+
+        Interlocked.Increment(ref _ubTotal);
+
+        var cfg = methodContext.ControlFlowGraph;
+        if (cfg == null)
+        {
+            _ubChain.AddOrUpdate("no_cfg", 1, (_, n) => n + 1);
+            return;
+        }
+
+        var chain = new List<string>();
+        var current = match.Groups[1].Value;
+        var visited = new HashSet<string>();
+
+        for (var hop = 0; hop < 4 && visited.Add(current); hop++)
+        {
+            var def = FindDefinition(cfg.Instructions, current);
+            if (def == null)
+            {
+                chain.Add("no_def(" + current + ")");
+                break;
+            }
+
+            if (def.OpCode == Cpp2IL.Core.ISIL.OpCode.Call)
+            {
+                var target = def.Operands.Count > 0 ? def.Operands[0] : null;
+                chain.Add("<-call(" + (target is MethodAnalysisContext tm ? tm.Name : target?.GetType().Name ?? "?") + ")");
+                break;
+            }
+
+            if (def.OpCode == Cpp2IL.Core.ISIL.OpCode.Phi)
+            {
+                chain.Add("<-phi");
+                break;
+            }
+
+            if (def.OpCode != Cpp2IL.Core.ISIL.OpCode.Move)
+            {
+                chain.Add("<-" + def.OpCode);
+                break;
+            }
+
+            var src = def.Operands.Count > 1 ? def.Operands[1] : null;
+
+            if (src is Cpp2IL.Core.ISIL.MemoryOperand mem)
+            {
+                if (mem.Base == null && mem.Index == null)
+                {
+                    var addr = (ulong)mem.Addend;
+                    var known = methodContext.AppContext.LibCpp2IlContext.GetAnyGlobalByAddress(addr) != null;
+                    chain.Add(known ? "<-metaglobal_KNOWN" : "<-const_addr_UNKNOWN");
+                    Interlocked.Increment(ref _ubConstTotal);
+                    _ubConstAddr.AddOrUpdate($"0x{addr:X}", 1, (_, n) => n + 1);
+                    if (known)
+                    {
+                        Interlocked.Increment(ref _ubConstKnownTotal);
+                        _ubConstAddrKnown.AddOrUpdate($"0x{addr:X}", 1, (_, n) => n + 1);
+                    }
+
+                    break;
+                }
+
+                if (mem.Base is Cpp2IL.Core.ISIL.LocalVariable baseLocal)
+                {
+                    chain.Add("<-load_of:" + baseLocal.Name);
+                    current = baseLocal.Name;
+                    continue;
+                }
+
+                chain.Add("<-memop_base_other");
+                break;
+            }
+
+            if (src is Cpp2IL.Core.ISIL.LocalVariable copy)
+            {
+                chain.Add("<-copy_of:" + copy.Name);
+                current = copy.Name;
+                continue;
+            }
+
+            if (src is Cpp2IL.Core.ISIL.Immediate imm)
+            {
+                chain.Add($"<-imm_0x{imm.UnsignedValue:X}");
+                break;
+            }
+
+            chain.Add("<-" + (src?.GetType().Name ?? "null"));
+            break;
+        }
+
+        _ubChain.AddOrUpdate(string.Join(" ", chain), 1, (_, n) => n + 1);
+    }
+
+    /// <summary>The instruction that defines <paramref name="localName"/>, or null.</summary>
+    private static Cpp2IL.Core.ISIL.Instruction? FindDefinition(
+        IEnumerable<Cpp2IL.Core.ISIL.Instruction> instructions, string localName)
+    {
+        foreach (var ins in instructions)
+        {
+            if (ins.OpCode == Cpp2IL.Core.ISIL.OpCode.Call)
+            {
+                // a call's result is operand 1; operand 0 is the call target
+                if (ins.Operands.Count > 1 && ins.Operands[1] is Cpp2IL.Core.ISIL.LocalVariable c && c.Name == localName)
+                    return ins;
+                continue;
+            }
+
+            if (ins.Operands.Count > 0 && ins.Operands[0] is Cpp2IL.Core.ISIL.LocalVariable d && d.Name == localName)
+                return ins;
+        }
+
+        return null;
+    }
+
     /// <summary>All metadata-usage global slot addresses known from the metadata (pre-27 path).</summary>
     private ulong[] GetSlotAddresses(LibCpp2IlContext lib)
     {
@@ -336,7 +487,19 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
     public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
     {
-        var ret = base.BuildAssemblies(context);
+        // Defer the per-method ISIL/CFG release so FillMethodBody can walk operand provenance; each
+        // method is released in FillMethodBody's finally, so peak retention is one method's CFG.
+        MethodAnalysisContext.DeferAnalysisDataRelease = true;
+
+        List<AssemblyDefinition> ret;
+        try
+        {
+            ret = base.BuildAssemblies(context);
+        }
+        finally
+        {
+            MethodAnalysisContext.DeferAnalysisDataRelease = false;
+        }
 
         var stubPlaceholder = _placeholder;
         var issues = _issues.Count;
@@ -408,7 +571,41 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         }
 
         ReportMethodNotFoundDiagnostics(root);
+        ReportUntypedBaseDiagnostics(root);
     }
+
+    private void ReportUntypedBaseDiagnostics(string root)
+    {
+        var total = Volatile.Read(ref _ubTotal);
+        var constTotal = Volatile.Read(ref _ubConstTotal);
+        var constKnown = Volatile.Read(ref _ubConstKnownTotal);
+        Logger.InfoNewline(
+            $"[IlRecoverySafe][ub] untyped-base memory loads: total={total}, terminal-const-addr={constTotal}, " +
+            $"of which known-metadata-global={constKnown} ({KnownPct(constKnown, constTotal)})",
+            "IlRecoverySafe");
+
+        foreach (var (chain, count) in _ubChain.OrderByDescending(kv => kv.Value).Take(25))
+            Logger.InfoNewline($"[IlRecoverySafe][ub]   x{count}\t{chain}", "IlRecoverySafe");
+
+        try
+        {
+            var lines = new List<string> { "chain\tcount" };
+            lines.AddRange(_ubChain.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}\t{kv.Value}"));
+            lines.Add("--- terminal const addr (addr | count | known_metadata_global) ---");
+            lines.AddRange(_ubConstAddr.OrderByDescending(kv => kv.Value).Take(40)
+                .Select(kv => $"{kv.Key}\t{kv.Value}\t{(_ubConstAddrKnown.ContainsKey(kv.Key) ? 1 : 0)}"));
+            var path = Path.Combine(root, "dll_il_recovery_safe.untypedbase.tsv");
+            File.WriteAllLines(path, lines);
+            Logger.InfoNewline($"[IlRecoverySafe] untypedbase: {path}", "IlRecoverySafe");
+        }
+        catch (Exception e)
+        {
+            Logger.ErrorNewline($"[IlRecoverySafe] failed to write untypedbase: {e.Message}", "IlRecoverySafe");
+        }
+    }
+
+    private static string KnownPct(int known, int total)
+        => total == 0 ? "n/a" : $"{100.0 * known / total:F1}%";
 
     private void ReportMethodNotFoundDiagnostics(string root)
     {

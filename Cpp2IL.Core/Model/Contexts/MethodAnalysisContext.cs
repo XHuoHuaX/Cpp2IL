@@ -462,7 +462,25 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
 
+    /// <summary>
+    /// Diagnostic hook. When set by a diagnostic output format, <see cref="ReleaseAnalysisData"/>
+    /// defers instead of nulling the ISIL/CFG, so that format can inspect analysis results AFTER
+    /// generating the method body, and then release explicitly via
+    /// <see cref="ReleaseAnalysisDataNow"/>. This keeps retention bounded to one method at a time
+    /// (the format must call <see cref="ReleaseAnalysisDataNow"/> in a finally block).
+    /// </summary>
+    public static bool DeferAnalysisDataRelease;
+
     public void ReleaseAnalysisData()
+    {
+        if (DeferAnalysisDataRelease)
+            return; // released later by ReleaseAnalysisDataNow()
+
+        ReleaseAnalysisDataNow();
+    }
+
+    /// <summary>Actually drops the ISIL/CFG/dominance data. Safe to call more than once.</summary>
+    public void ReleaseAnalysisDataNow()
     {
         ConvertedIsil = null;
         ControlFlowGraph = null;
