@@ -67,6 +67,14 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     private readonly ConcurrentDictionary<string, int> _ubConstAddrKnown = new(); // of the above: known metadata global?
     private int _ubTotal, _ubConstTotal, _ubConstKnownTotal;
 
+    // Optional targeted ISIL dump for a name filter (env CPP2IL_DUMP_ISIL_FOR, ';'-separated substrings).
+    // Used to obtain exact ground truth for a handful of failing methods without a full 450MB ISIL dump.
+    private static readonly string[] IsilDumpFilter =
+        (Environment.GetEnvironmentVariable("CPP2IL_DUMP_ISIL_FOR") ?? "")
+        .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    private readonly ConcurrentBag<string> _isilDump = new();
+    private int _isilDumped;
+
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
         // The base releases ISIL/CFG at the end of its FillMethodBody. Because our diagnostics need
@@ -116,6 +124,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                 AnalyzePlaceholderAddress(methodContext, detail);
                 AnalyzeMethodNotFound(methodContext, detail);
                 AnalyzeUntypedBase(methodContext, detail);
+                MaybeDumpIsil(methodContext, detail);
             }
             else
             {
@@ -372,6 +381,45 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         _ubChain.AddOrUpdate(string.Join(" ", chain), 1, (_, n) => n + 1);
     }
 
+    /// <summary>
+    /// When CPP2IL_DUMP_ISIL_FOR matches the method name, writes the full ISIL (with operand types and
+    /// the type of each operand's defining local) for that method, so a fix can be designed against
+    /// exact ground truth. Bounded to a handful of methods by the filter.
+    /// </summary>
+    private void MaybeDumpIsil(MethodAnalysisContext methodContext, string detail)
+    {
+        if (IsilDumpFilter.Length == 0 || _isilDumped >= 40)
+            return;
+
+        var fullName = methodContext.FullName;
+        if (!IsilDumpFilter.Any(f => fullName.Contains(f, StringComparison.Ordinal)))
+            return;
+
+        Interlocked.Increment(ref _isilDumped);
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"===== {methodContext.DeclaringType?.DeclaringAssembly?.Name} :: {fullName}");
+        sb.AppendLine($"first issue: {detail}");
+        sb.AppendLine("globals/locals:");
+
+        foreach (var l in methodContext.Locals.OrderBy(l => l.Name, StringComparer.Ordinal))
+            sb.AppendLine($"    local {l.Name} @ {l.Register}  type={(l.Type?.FullName ?? "<null>")}" +
+                          (l.IsThis ? " [this]" : "") + (l.IsReturn ? " [ret]" : "") + (l.IsMethodInfo ? " [mi]" : ""));
+
+        if (methodContext.ControlFlowGraph is { } cfg)
+        {
+            sb.AppendLine("instructions:");
+            for (var i = 0; i < cfg.Instructions.Count; i++)
+                sb.AppendLine($"    {i,4}: {cfg.Instructions[i]}");
+        }
+        else
+        {
+            sb.AppendLine("instructions: <no CFG>");
+        }
+
+        _isilDump.Add(sb.ToString());
+    }
+
     /// <summary>The instruction that defines <paramref name="localName"/>, or null.</summary>
     private static Cpp2IL.Core.ISIL.Instruction? FindDefinition(
         IEnumerable<Cpp2IL.Core.ISIL.Instruction> instructions, string localName)
@@ -572,6 +620,20 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
         ReportMethodNotFoundDiagnostics(root);
         ReportUntypedBaseDiagnostics(root);
+
+        if (_isilDump.Count > 0)
+        {
+            try
+            {
+                var path = Path.Combine(root, "dll_il_recovery_safe.isildump.txt");
+                File.WriteAllText(path, string.Join("\n", _isilDump));
+                Logger.InfoNewline($"[IlRecoverySafe] isildump ({_isilDump.Count} methods): {path}", "IlRecoverySafe");
+            }
+            catch (Exception e)
+            {
+                Logger.ErrorNewline($"[IlRecoverySafe] failed to write isildump: {e.Message}", "IlRecoverySafe");
+            }
+        }
     }
 
     private void ReportUntypedBaseDiagnostics(string root)
