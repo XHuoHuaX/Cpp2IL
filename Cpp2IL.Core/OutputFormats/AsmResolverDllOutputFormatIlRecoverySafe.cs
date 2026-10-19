@@ -620,6 +620,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
         ReportMethodNotFoundDiagnostics(root);
         ReportUntypedBaseDiagnostics(root);
+        ReportGuardRemoverDiagnostics(root);
 
         if (_isilDump.Count > 0)
         {
@@ -663,6 +664,34 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         catch (Exception e)
         {
             Logger.ErrorNewline($"[IlRecoverySafe] failed to write untypedbase: {e.Message}", "IlRecoverySafe");
+        }
+    }
+
+    private void ReportGuardRemoverDiagnostics(string root)
+    {
+        var diags = Cpp2IL.Core.Analysis.MetadataInitGuardRemover.Diagnostics;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("key\tcount");
+        foreach (var (key, count) in diags.OrderByDescending(kv => kv.Value))
+            sb.AppendLine($"{key}\t{count}");
+
+        sb.AppendLine("--- guard shape samples (as seen by TryRemoveGuard) ---");
+        foreach (var sample in Cpp2IL.Core.Analysis.MetadataInitGuardRemover.GuardShapeSamples.Take(16))
+            sb.AppendLine(sample);
+
+        foreach (var (key, count) in diags.OrderByDescending(kv => kv.Value).Take(30))
+            Logger.InfoNewline($"[IlRecoverySafe][guard]   x{count}\t{key}", "IlRecoverySafe");
+
+        try
+        {
+            var path = Path.Combine(root, "dll_il_recovery_safe.guarddiag.tsv");
+            File.WriteAllText(path, sb.ToString());
+            Logger.InfoNewline($"[IlRecoverySafe] guarddiag: {path}", "IlRecoverySafe");
+        }
+        catch (Exception e)
+        {
+            Logger.ErrorNewline($"[IlRecoverySafe] failed to write guarddiag: {e.Message}", "IlRecoverySafe");
         }
     }
 

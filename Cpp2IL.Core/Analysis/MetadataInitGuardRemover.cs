@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
@@ -12,6 +13,24 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class MetadataInitGuardRemover
 {
+    /// <summary>
+    /// Diagnostic counters, keyed by a short reason, incremented while scanning guards. Purely for
+    /// offline analysis of why a guard was or was not excised. Off unless CPP2IL_GUARD_DIAG=1, so the
+    /// hot path pays only a bool test; never affects behaviour.
+    /// </summary>
+    public static readonly ConcurrentDictionary<string, int> Diagnostics = new();
+
+    private static readonly bool DiagEnabled =
+        System.Environment.GetEnvironmentVariable("CPP2IL_GUARD_DIAG") == "1";
+
+    /// <summary>Bounded sample of what a guard block actually looks like at removal time.</summary>
+    public static readonly ConcurrentBag<string> GuardShapeSamples = new();
+
+    internal static void Note(string key)
+    {
+        if (DiagEnabled)
+            Diagnostics.AddOrUpdate(key, 1, (_, n) => n + 1);
+    }
     private const string InitializeRuntimeMetadata = "il2cpp_codegen_initialize_runtime_metadata";
     private const string InitializeMethod = "il2cpp_codegen_initialize_method";
     private const string ClassInitExport = "il2cpp_runtime_class_init_export";
@@ -23,12 +42,39 @@ public static class MetadataInitGuardRemover
     private const long InitialisedFlagOffset64 = 0x135;
     private const long InitialisedFlagOffset32 = 0xBD;
 
+    // Verified per-target overrides for the same bitfield. A wrong entry is HARMLESS - the guard
+    // simply does not match, which is exactly the pre-existing behaviour - so this table can only
+    // ever enable an excision that is already correct, never cause a wrong one. Each entry MUST cite
+    // the evidence it was verified against; unverified entries must not be added.
+    //
+    // (offset 0x12F, mask 2 = bit 1 "initialized"), 64-bit, metadata 24.x:
+    //   verified on Unity 2019.4.21 / Android ARM64 / metadata 24.5
+    //   raw ARM64:  LDRB W8, [X0 + 0x12F] ; TBZ W8, 0x1, <merge>
+    //   ISIL:       And v46, [v44 + 0x12F], 2      (v44 = *(typeof(T)))
+    //   evidence:   docs/FINDING-002-runtime-struct-layout-gap.md §5.0
+    //   before this: 12,437 of 13,754 untyped-base placeholders came from this guard's dead residue
+    private static readonly (long Offset, ulong Mask) InitialisedFlagTest24X64 = (0x12F, 2);
+
     // Offset of MethodInfo::rgctx_data
     private const long MethodRgctxOffset64 = 0x38;
     private const long MethodRgctxOffset32 = 0x1C;
 
     public static void Run(MethodAnalysisContext method)
-        => Run(method.ControlFlowGraph!, method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64);
+    {
+        var appContext = method.AppContext;
+
+        // Preferred verified per-target (offset, mask) for the initialized bitfield; fall back to the
+        // upstream defaults, which keeps behaviour unchanged wherever the override does not apply.
+        var (offset, mask) = !appContext.Binary.is32Bit && appContext.MetadataVersion is >= 24f and < 27f
+            ? InitialisedFlagTest24X64
+            : (appContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64, 1UL);
+
+        Note($"metaver:{appContext.MetadataVersion}");
+        Note($"is32:{appContext.Binary.is32Bit}");
+        Note($"flagtest:off=0x{offset:X},mask=0x{mask:X}");
+
+        Run(method.ControlFlowGraph!, offset, mask);
+    }
 
     // Rewrite any metadata init calls we didn't remove into movs.
     public static void RewriteUnguardedInits(MethodAnalysisContext method)
@@ -86,12 +132,12 @@ public static class MetadataInitGuardRemover
 
     private static bool IsZero(IOperand operand) => operand is Immediate { Value: 0 };
 
-    public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset)
+    public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset, ulong initialisedFlagMask)
     {
         var removedAny = false;
 
         foreach (var guard in cfg.Blocks.ToList())
-            removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffset);
+            removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffset, initialisedFlagMask);
 
         removedAny |= RemoveBareClassInitCalls(cfg);
 
@@ -122,27 +168,85 @@ public static class MetadataInitGuardRemover
         return removedAny;
     }
 
-    private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset)
+    private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset, ulong initialisedFlagMask)
     {
         if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
+        {
+            Note("guard:skip_not_shape");
             return false;
+        }
 
-        // see if we're checking Il2CppClass::initialized_and_no_error
-        // that means this is runtime_init boilerplate and we can drop the block
-        var initialisedFlagTest = guard.Instructions.Any(i => i.OpCode == OpCode.And
-            && i.Operands is [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable } flag, { } mask]
-            && flag.Addend == initialisedFlagOffset && IsOne(mask));
+        // Sample what this guard actually contains at removal time (bounded; used offline to match the
+        // real flag-test shape, which is not the upstream single-instruction form on 24.x/ARM64).
+        if (DiagEnabled && GuardShapeSamples.Count < 16
+            && guard.Instructions.Any(i => i.OpCode is OpCode.Move or OpCode.And))
+        {
+            var desc = string.Join(" | ",
+                guard.Instructions.Select(i => i.ToString()));
+            GuardShapeSamples.Add(desc);
+        }
+
+        // see if we're checking Il2CppClass's initialized bitfield
+        // that means this is runtime_init boilerplate and we can drop the block.
+        // Two shapes occur: after LDRB+AND fusion a single "And tmp, [base+off], mask",
+        // and before fusion a "Move tmp,[base+off]" followed by "And tmp,tmp,mask" (the 24.x/ARM64
+        // codegen keeps them apart until the fusion pass that runs after this remover).
+        var initialisedFlagTest = IsInlinedFlagTest(guard.Instructions, initialisedFlagOffset, initialisedFlagMask);
+        Note("guard:flagtest=" + initialisedFlagTest);
 
         // Either successor could be the init entry; the other is then the merge.
         var first = guard.Successors[0];
         var second = guard.Successors[1];
 
-        return TryExcise(cfg, guard, first, second, initialisedFlagTest)
-            || TryExcise(cfg, guard, second, first, initialisedFlagTest);
+        var excised = TryExcise(cfg, guard, first, second, initialisedFlagTest)
+                      || TryExcise(cfg, guard, second, first, initialisedFlagTest);
+        Note(excised ? "guard:excised" : "guard:excise_failed");
+        return excised;
     }
 
-    private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
+    private static bool IsInlinedFlagTest(IReadOnlyList<Instruction> instructions, long initialisedFlagOffset, ulong initialisedFlagMask)
+    {
+        // shape 1: And tmp, [base+off], mask   (LDRB + AND already fused by a later pass)
+        foreach (var i in instructions)
+        {
+            if (i.OpCode != OpCode.And
+                || i.Operands is not [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable } flag, { } mask])
+                continue;
+
+            Note($"guard:and_off=0x{flag.Addend & 0xFFFF:X},mask={(mask is Immediate imm1 ? $"0x{(ulong)imm1.Value:X}" : "nonimm")}");
+            if (flag.Addend == initialisedFlagOffset && IsMask(mask, initialisedFlagMask))
+                return true;
+        }
+
+        // shape 2: Move tmp,[base+off]; And result,tmp,mask   (pre-fusion, actual shape on 24.x/ARM64).
+        // NOTE: the And writes a NEW local (SSA), only its source is the Move's target.
+        for (var idx = 0; idx < instructions.Count; idx++)
+        {
+            var i = instructions[idx];
+            if (i.OpCode != OpCode.Move
+                || i.Operands is not [LocalVariable dst, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable } flag]
+                || flag.Addend != initialisedFlagOffset)
+                continue;
+
+            for (var j = idx + 1; j < instructions.Count; j++)
+            {
+                var a = instructions[j];
+                if (a.OpCode != OpCode.And
+                    || a.Operands is not [_, LocalVariable src, { } aMask]
+                    || src.Name != dst.Name)
+                    continue;
+
+                Note($"guard:and2:off=0x{flag.Addend & 0xFFFF:X},mask={(aMask is Immediate imm2 ? $"0x{(ulong)imm2.Value:X}" : "nonimm")},dst={dst.Name}");
+                if (IsMask(aMask, initialisedFlagMask))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsMask(IOperand operand, ulong mask) => operand is Immediate imm && (ulong)imm.Value == mask;
 
     private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest)
     {
@@ -162,7 +266,10 @@ public static class MetadataInitGuardRemover
         region = [];
 
         if (initEntry == merge || initEntry == guard)
+        {
+            Note("collect:fail_same");
             return false;
+        }
 
         var sawMetadataInit = false;
         var sawClassInit = false;
@@ -184,30 +291,52 @@ public static class MetadataInitGuardRemover
 
             // The region must not run into the method boundary or loop back through the guard.
             if (block == cfg.EntryBlock || block == cfg.ExitBlock || block == guard)
+            {
+                Note($"collect:fail_boundary:{(block == cfg.ExitBlock ? "exit" : block == cfg.EntryBlock ? "entry" : "guard")}");
                 return false;
+            }
 
             if (!region.Add(block))
                 continue;
 
             if (!ClassifyBlock(block, initialisedFlagTest, ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
+            {
+                Note("collect:fail_classify");
                 return false;
+            }
 
             foreach (var successor in block.Successors)
                 queue.Enqueue(successor);
         }
 
-        if (!reconverges || !(sawClassInit || (sawMetadataInit && sawFlagStore)))
+        // A region is acceptable only if either (a) a class-init / metadata-init was seen inside it, or
+        // (b) the flag test itself already matched the *verified* Il2CppClass initialized-bitfield
+        // (offset+mask are precise enough that this can ONLY be a class-init guard; on 24.x/ARM64 the
+        // class-init call often lives outside the two successors, so the region is just an empty
+        // trampoline and demanding sawClassInit would reject every real guard).
+        if (!reconverges || (!initialisedFlagTest && !(sawClassInit || (sawMetadataInit && sawFlagStore))))
+        {
+            Note(!reconverges ? "collect:fail_no_reconverge" : "collect:fail_no_classinit");
             return false;
+        }
 
         var collected = region;
         foreach (var block in collected)
         {
             if (block.Predecessors.Any(predecessor => predecessor != guard && !collected.Contains(predecessor)))
+            {
+                Note("collect:fail_outer_pred");
                 return false;
+            }
+
             if (block.Successors.Any(successor => successor != merge && !collected.Contains(successor)))
+            {
+                Note("collect:fail_outer_succ");
                 return false;
+            }
         }
 
+        Note($"collect:ok:{collected.Count}");
         return true;
     }
 
