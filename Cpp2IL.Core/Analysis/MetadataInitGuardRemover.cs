@@ -26,6 +26,9 @@ public static class MetadataInitGuardRemover
     /// <summary>Bounded sample of what a guard block actually looks like at removal time.</summary>
     public static readonly ConcurrentBag<string> GuardShapeSamples = new();
 
+    /// <summary>Bounded sample of flag-test guards that could not be excised (block layout).</summary>
+    public static readonly ConcurrentBag<string> GuardFailureSamples = new();
+
     internal static void Note(string key)
     {
         if (DiagEnabled)
@@ -202,7 +205,26 @@ public static class MetadataInitGuardRemover
         var excised = TryExcise(cfg, guard, first, second, initialisedFlagTest)
                       || TryExcise(cfg, guard, second, first, initialisedFlagTest);
         Note(excised ? "guard:excised" : "guard:excise_failed");
+        if (!excised && initialisedFlagTest && DiagEnabled && GuardFailureSamples.Count < 12)
+            RecordFailureSample(guard, first, second);
+
         return excised;
+    }
+
+    /// <summary>Captures the exact block layout of a flag-test guard that could not be excised.</summary>
+    private static void RecordFailureSample(Block guard, Block first, Block second)
+    {
+        static string Describe(Block block)
+        {
+            var text = string.Join(" | ", block.Instructions.Select(i => i.ToString()));
+            if (text.Length > 700)
+                text = text[..700] + "…";
+
+            return $"{block.BlockType}[succ={block.Successors.Count},pred={block.Predecessors.Count}] {text}";
+        }
+
+        GuardFailureSamples.Add(
+            $"GUARD {Describe(guard)}\n  SUCC0 {Describe(first)}\n  SUCC1 {Describe(second)}");
     }
 
     private static bool IsInlinedFlagTest(IReadOnlyList<Instruction> instructions, long initialisedFlagOffset, ulong initialisedFlagMask)
@@ -299,9 +321,12 @@ public static class MetadataInitGuardRemover
             if (!region.Add(block))
                 continue;
 
-            if (!ClassifyBlock(block, initialisedFlagTest, ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
+            var pureRuntimeTest = initialisedFlagTest && IsPureRuntimeTestBlock(block);
+
+            if (!pureRuntimeTest && !ClassifyBlock(block, initialisedFlagTest, ref sawMetadataInit, ref sawClassInit, ref sawFlagStore, out var offending))
             {
-                Note("collect:fail_classify");
+                Note($"collect:fail_classify:{(offending == null ? "?" : offending.OpCode.ToString())}" +
+                     (initialisedFlagTest ? ":flag" : ""));
                 return false;
             }
 
@@ -343,8 +368,11 @@ public static class MetadataInitGuardRemover
     // A region block is acceptable only if every instruction is intra-region control flow, an init
     // call, the flag store, or otherwise side-effect-free (writes a local, not memory). A managed call
     // or any other store would have an effect we cannot silently drop, so it disqualifies the region.
-    private static bool ClassifyBlock(Block block, bool initialisedFlagTest, ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore)
+    private static bool ClassifyBlock(Block block, bool initialisedFlagTest, ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore,
+        out Instruction? offending)
     {
+        offending = null;
+
         foreach (var instruction in block.Instructions)
         {
             switch (instruction.OpCode)
@@ -360,14 +388,20 @@ public static class MetadataInitGuardRemover
 
                 case OpCode.Call or OpCode.CallVoid:
                     if (instruction.Operands is not [StringLiteral { Value: var name }, ..])
+                    {
+                        offending = instruction;
                         return false;
+                    }
 
                     if (name is InitializeRuntimeMetadata or InitializeMethod)
                         sawMetadataInit = true;
                     else if (name is ClassInitExport or ClassInitActual or ClassInitCodegen)
                         sawClassInit = true;
                     else
+                    {
+                        offending = instruction;
                         return false;
+                    }
 
                     break;
 
@@ -377,12 +411,48 @@ public static class MetadataInitGuardRemover
 
                 default:
                     if (!IsSideEffectFree(instruction))
+                    {
+                        offending = instruction;
                         return false;
+                    }
+
                     break;
             }
         }
 
         return true;
+    }
+
+    // A block that only reads memory into locals, compares, and branches - the shape of the extra
+    // runtime-state test IL2CPP chains after the initialized bit (observed: klass->cctor_started at
+    // +0xE0, branching to the same merge as the initialized test). Deleting such a block cannot drop
+    // work: it has no call, no store, no phi and no return, so its only effect is a branch that the
+    // surrounding checks already require to reconverge on the same merge.
+    private static bool IsPureRuntimeTestBlock(Block block)
+    {
+        if (block.Instructions.Count == 0)
+            return false;
+
+        var sawBranch = false;
+
+        foreach (var instruction in block.Instructions)
+        {
+            switch (instruction.OpCode)
+            {
+                case OpCode.ConditionalJump:
+                    sawBranch = true;
+                    break;
+                case OpCode.Jump or OpCode.Nop:
+                    break;
+                default:
+                    if (!IsSideEffectFree(instruction))
+                        return false;
+
+                    break;
+            }
+        }
+
+        return sawBranch;
     }
 
     // True for instructions that only compute a value into a local (or do nothing). A store - any

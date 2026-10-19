@@ -378,7 +378,10 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             break;
         }
 
-        _ubChain.AddOrUpdate(string.Join(" ", chain), 1, (_, n) => n + 1);
+        // Prefix the chain with the accessed offset so families like +0x12F can be told apart from
+        // genuine managed field reads at the same offset.
+        var addendKey = match.Groups[4].Success ? "+0x" + match.Groups[4].Value : "+?";
+        _ubChain.AddOrUpdate($"{addendKey} {string.Join(" ", chain)}", 1, (_, n) => n + 1);
     }
 
     /// <summary>
@@ -678,6 +681,10 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
         sb.AppendLine("--- guard shape samples (as seen by TryRemoveGuard) ---");
         foreach (var sample in Cpp2IL.Core.Analysis.MetadataInitGuardRemover.GuardShapeSamples.Take(16))
+            sb.AppendLine(sample);
+
+        sb.AppendLine("--- flag-test guards that failed to excise ---");
+        foreach (var sample in Cpp2IL.Core.Analysis.MetadataInitGuardRemover.GuardFailureSamples.Take(12))
             sb.AppendLine(sample);
 
         foreach (var (key, count) in diags.OrderByDescending(kv => kv.Value).Take(30))
