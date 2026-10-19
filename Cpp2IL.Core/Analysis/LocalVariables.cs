@@ -399,7 +399,23 @@ public static class LocalVariables
             if (instruction.Operands[1] is not MemoryOperand { Index: null, Scale: 0 } memory || memory.Addend != staticFieldsOffset)
                 continue;
 
-            if (memory.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var owner } })
+            if (memory.Base is not LocalVariable baseLocal)
+                continue;
+
+            var owner = baseLocal.Type switch
+            {
+                RuntimeClassTypeAnalysisContext { RepresentedType: var direct } => direct,
+                // ARM64 / metadata 24.x loads the class handle through one extra indirection: the
+                // codegen emits `Move klass,[typeof(T)]` and then `LDR X,[klass + static_fields]`.
+                // Cpp2IL types the metadata-usage load itself as an opaque
+                // RuntimeClassTypeAnalysisContext (which has no fields), so the intermediate local
+                // stays untyped and the direct rule above never fires - the static field then shows
+                // up as an opaque memory access. Look through exactly that one indirection.
+                null => FindClassHandleOwner(method, baseLocal),
+                _ => null,
+            };
+
+            if (owner == null)
                 continue;
 
             destination.Type = new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly);
@@ -407,6 +423,33 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// If <paramref name="local"/> is defined by a single load with no addend from a local typed as
+    /// <see cref="RuntimeClassTypeAnalysisContext"/>, returns the type that handle represents.
+    /// This is the one-indirection class-handle load the ARM64 codegen emits before touching
+    /// <c>Il2CppClass::static_fields</c>.
+    /// </summary>
+    private static TypeAnalysisContext? FindClassHandleOwner(MethodAnalysisContext method, LocalVariable local)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move || instruction.Operands.Count < 2)
+                continue;
+
+            if (instruction.Operands[0] is not LocalVariable dst || dst.Name != local.Name)
+                continue;
+
+            // only the first definition counts - a phi or a second definition means we cannot say
+            if (instruction.Operands[1] is MemoryOperand { Index: null, Scale: 0, Addend: 0 } memory
+                && memory.Base is LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented } })
+                return represented;
+
+            return null;
+        }
+
+        return null;
     }
 
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
