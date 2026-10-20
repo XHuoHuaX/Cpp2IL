@@ -75,6 +75,14 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     private readonly ConcurrentBag<string> _isilDump = new();
     private int _isilDumped;
 
+    // Same idea, but keyed on the method's first issue text (regex) so a whole failure family can be
+    // sampled without knowing any method names:
+    //   CPP2IL_DUMP_ISSUE_RE='Indirect call:.*\+2D0'
+    private static readonly Regex? IsilDumpIssueFilter =
+        (Environment.GetEnvironmentVariable("CPP2IL_DUMP_ISSUE_RE") ?? "") is { Length: > 0 } issuePattern
+            ? new Regex(issuePattern, RegexOptions.Compiled)
+            : null;
+
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
         // The base releases ISIL/CFG at the end of its FillMethodBody. Because our diagnostics need
@@ -391,11 +399,15 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     /// </summary>
     private void MaybeDumpIsil(MethodAnalysisContext methodContext, string detail)
     {
-        if (IsilDumpFilter.Length == 0 || _isilDumped >= 40)
+        if ((IsilDumpFilter.Length == 0 && IsilDumpIssueFilter == null) || _isilDumped >= 40)
             return;
 
         var fullName = methodContext.FullName;
-        if (!IsilDumpFilter.Any(f => fullName.Contains(f, StringComparison.Ordinal)))
+        var byName = IsilDumpFilter.Length > 0
+                     && IsilDumpFilter.Any(f => fullName.Contains(f, StringComparison.Ordinal));
+        var byIssue = IsilDumpIssueFilter?.IsMatch(detail) == true;
+
+        if (!byName && !byIssue)
             return;
 
         Interlocked.Increment(ref _isilDumped);
