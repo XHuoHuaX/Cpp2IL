@@ -611,13 +611,29 @@ public static class MetadataResolver
     // TODO this is almost certainly not correct on every version
     private const long VTableOffset64 = 0x138;
     private const long VTableOffset32 = 0xC0;
-    
+
+    // Verified per-target override for the vtable offset (64-bit, metadata 24.x).
+    // Evidence from this target (Unity 2019.4.21 / Android ARM64 / metadata 24.5):
+    //   * every virtual-slot load observed in the corpus has an addend that is a multiple of 16,
+    //     while 0x138 (= 312) is 8 mod 16 - that constant can never address a 16-byte entry;
+    //   * the smallest observed addend is exactly 0x130 (= slot 0) and slot 1 is unobserved while
+    //     slots 0 and 2..479 are, which is the shape of a real vtable with a reserved entry;
+    //   * 0x130 sits immediately after the Il2CppClass initialized bitfield byte at 0x12F, which
+    //     was verified independently when the class-init guards were fixed (be0769ff).
+    // A wrong value here can only make a slot fail the `slot < VtableCount` check (i.e. stay
+    // unresolved, exactly as before), never silently bind a different method.
+    private const long VTableOffset24X64 = 0x130;
+
     // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
     // as long as the klass local's represented type is known.
     public static bool ResolveVirtualCalls(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
-        var vtableOffset = pointerSize == 8 ? VTableOffset64 : VTableOffset32;
+        var vtableOffset = pointerSize != 8
+            ? VTableOffset32
+            : method.AppContext.MetadataVersion is >= 24f and < 27f
+                ? VTableOffset24X64
+                : VTableOffset64;
         var invokeDataSize = 2L * pointerSize;
         var changed = false;
 
