@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -180,6 +181,8 @@ public class AttributeInjectorProcessingLayer : Cpp2IlProcessingLayer
 
     private static void ProcessCustomAttributesForContext(HasCustomAttributes context, FieldAnalysisContext typeField, FieldAnalysisContext rvaField, FieldAnalysisContext offsetField, MethodAnalysisContext ctor)
     {
+        var seenReplacements = new HashSet<string>(StringComparer.Ordinal);
+
         if (_useEzDiffMode)
             context.CustomAttributes = [];
         else
@@ -198,14 +201,27 @@ public class AttributeInjectorProcessingLayer : Cpp2IlProcessingLayer
                 //Attribute has all required parameters, so we don't need an injected one
                 continue;
 
-            //Create replacement attribute
-            var replacementAttribute = new AnalyzedCustomAttribute(ctor);
-
             //Get ptr, and from it, rva and offset
             var generatorPtr = context.CaCacheGeneratorAnalysis!.UnderlyingPointer;
             var generatorRva = context.AppContext.Binary.GetRva(generatorPtr);
             if (!context.AppContext.Binary.TryMapVirtualAddressToRaw(generatorPtr, out var offsetInBinary))
                 offsetInBinary = 0;
+
+            // The replacement attribute carries only (Type, RVA, Offset), all derived from the member
+            // rather than from the individual attribute. Two attributes of the same type on one member
+            // therefore produce two byte-identical injected attributes, which the C# compiler rejects
+            // with CS0579 ("attribute repeated"). Deduplicating is lossless: identical replacements are
+            // indistinguishable, so nothing is dropped that the replacement could have expressed.
+            var dedupeKey = $"{attribute.Constructor.DeclaringType.FullName}|{generatorRva:X}|{offsetInBinary:X}";
+            if (!seenReplacements.Add(dedupeKey))
+            {
+                context.CustomAttributes.RemoveAt(index);
+                index--;
+                continue;
+            }
+
+            //Create replacement attribute
+            var replacementAttribute = new AnalyzedCustomAttribute(ctor);
 
             //Add the 3 fields to the replacement attribute
             replacementAttribute.Fields.Add(new(typeField, new CustomAttributeTypeParameter(attribute.Constructor.DeclaringType, replacementAttribute, CustomAttributeParameterKind.Field, 0)));
