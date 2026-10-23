@@ -154,6 +154,8 @@ public static class MetadataResolver
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? local.Type;
+                if (staticOwner != null)
+                    LocalVariables.SfDiagPub("rf_static_base_seen");
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 FieldAnalysisContext? field;
@@ -182,13 +184,21 @@ public static class MetadataResolver
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
+                {
+                    // Distinguishes the two candidate root causes for "static field reads never
+                    // resolve": either the base was not recognised as a storage block at all, or it
+                    // was but no static field carries that offset (e.g. all static FieldOffsets are 0
+                    // in this metadata version, so `== 0x8` can never hold).
+                    LocalVariables.SfDiagPub(staticOwner == null ? "rf_no_field_instance_path" : "rf_no_field_static_path");
                     continue;
+                }
 
                 // make sure we have a full GIT for field access. open type is bad.
                 if (genericOwner != null)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
                 instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend));
+                LocalVariables.SfDiagPub(staticOwner != null ? "rf_static_match" : "rf_instance_match");
                 changed = true;
             }
         }

@@ -636,6 +636,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         ReportMethodNotFoundDiagnostics(root);
         ReportUntypedBaseDiagnostics(root);
         ReportGuardRemoverDiagnostics(root);
+        ReportStaticFieldDiagnostics(root);
 
         if (_isilDump.Count > 0)
         {
@@ -684,6 +685,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
     private void ReportGuardRemoverDiagnostics(string root)
     {
+
         var diags = Cpp2IL.Core.Analysis.MetadataInitGuardRemover.Diagnostics;
 
         var sb = new System.Text.StringBuilder();
@@ -711,6 +713,38 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         catch (Exception e)
         {
             Logger.ErrorNewline($"[IlRecoverySafe] failed to write guarddiag: {e.Message}", "IlRecoverySafe");
+        }
+    }
+
+    /// <summary>
+    /// Writes the static-field propagation histogram (see LocalVariables.StaticFieldDiag).
+    /// Motivation: an ISIL dump showed 82 accesses to [..+0xB8] (static_fields) and ZERO resolutions
+    /// to a FieldReference across 40 sampled methods, i.e. static field reads never become ldsfld.
+    /// These counters say which guard rejects them - evidence before changing behaviour.
+    /// </summary>
+    private void ReportStaticFieldDiagnostics(string root)
+    {
+        var diags = Cpp2IL.Core.Analysis.LocalVariables.StaticFieldDiag;
+        if (diags.IsEmpty)
+            return;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("key\tcount");
+        foreach (var (key, count) in diags.OrderByDescending(kv => kv.Value))
+            sb.AppendLine($"{key}\t{count}");
+
+        foreach (var (key, count) in diags.OrderByDescending(kv => kv.Value).Take(12))
+            Logger.InfoNewline($"[IlRecoverySafe][sf]   x{count}\t{key}", "IlRecoverySafe");
+
+        try
+        {
+            var path = Path.Combine(root, "dll_il_recovery_safe.sfdiag.tsv");
+            File.WriteAllText(path, sb.ToString());
+            Logger.InfoNewline($"[IlRecoverySafe] sfdiag: {path}", "IlRecoverySafe");
+        }
+        catch (Exception e)
+        {
+            Logger.ErrorNewline($"[IlRecoverySafe] failed to write sfdiag: {e.Message}", "IlRecoverySafe");
         }
     }
 

@@ -391,6 +391,23 @@ public static class LocalVariables
         return true;
     }
 
+    /// <summary>
+    /// Branch counters for the static-field-storage propagation, gated by CPP2IL_SF_DIAG=1.
+    /// Evidence first: an ISIL dump showed that `[..+0xB8]` (static_fields) was accessed 82 times in
+    /// 40 sampled methods and resolved to a FieldReference zero times, i.e. static field READS never
+    /// become ldsfld. These counters tell us which guard rejects them, instead of guessing.
+    /// </summary>
+    public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> StaticFieldDiag = new();
+    private static readonly bool SfDiagEnabled = System.Environment.GetEnvironmentVariable("CPP2IL_SF_DIAG") == "1";
+    private static void SfDiag(string key)
+    {
+        if (SfDiagEnabled)
+            StaticFieldDiag.AddOrUpdate(key, 1, (_, v) => v + 1);
+    }
+
+    /// <summary>Public sink so other analysis passes can feed the same histogram.</summary>
+    public static void SfDiagPub(string key) => SfDiag(key);
+
     private static bool PropagateStaticFieldStorage(MethodAnalysisContext method)
     {
         var staticFieldsOffset = method.AppContext.Binary.is32Bit ? StaticFieldsOffset32 : StaticFieldsOffset64;
@@ -407,8 +424,13 @@ public static class LocalVariables
             if (instruction.Operands[1] is not MemoryOperand { Index: null, Scale: 0 } memory || memory.Addend != staticFieldsOffset)
                 continue;
 
+            SfDiag($"sf_read_candidate");
+
             if (memory.Base is not LocalVariable baseLocal)
+            {
+                SfDiag("skip_base_not_local");
                 continue;
+            }
 
             var owner = baseLocal.Type switch
             {
@@ -424,8 +446,16 @@ public static class LocalVariables
             };
 
             if (owner == null)
+            {
+                // Classify WHY the one-indirection walk failed, so the histogram itself names the
+                // shapes instead of us guessing from a biased sample.
+                SfDiag(baseLocal.Type == null
+                    ? "skip_owner_null_from_untyped_base:" + ClassifyBaseDef(method, baseLocal)
+                    : "skip_owner_null_from_typed_base");
                 continue;
+            }
 
+            SfDiag("sf_storage_typed");
             destination.Type = new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly);
             changed = true;
         }
@@ -440,14 +470,47 @@ public static class LocalVariables
     /// <c>Il2CppClass::static_fields</c>.
     /// </summary>
     private static TypeAnalysisContext? FindClassHandleOwner(MethodAnalysisContext method, LocalVariable local)
+        => FindClassHandleOwnerCore(method, local, 0);
+
+    private static TypeAnalysisContext? FindClassHandleOwnerCore(MethodAnalysisContext method, LocalVariable local, int depth)
     {
+        // Depth limit: phi cycles are legal in the IR and must not spin.
+        if (depth > 4)
+            return null;
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            if (instruction.OpCode != OpCode.Move || instruction.Operands.Count < 2)
+            if (instruction.Operands.Count == 0 || instruction.Operands[0] is not LocalVariable dst || dst.Name != local.Name)
                 continue;
 
-            if (instruction.Operands[0] is not LocalVariable dst || dst.Name != local.Name)
-                continue;
+            // A merge point: `Phi dst, src1, src2, ...`. Looking through it is only sound when every
+            // incoming value resolves to the SAME class handle; otherwise the handle is genuinely
+            // ambiguous at this merge and we must not pick one of them.
+            // This is the dominant failure shape (26,441 of 35,276 static-field bases): the class
+            // handle is materialised in two branches and merged, so the first definition is a Phi.
+            if (instruction.OpCode == OpCode.Phi)
+            {
+                TypeAnalysisContext? agreed = null;
+                for (var i = 1; i < instruction.Operands.Count; i++)
+                {
+                    if (instruction.Operands[i] is not LocalVariable input)
+                        return null;
+
+                    var viaInput = FindClassHandleOwnerCore(method, input, depth + 1);
+                    if (viaInput == null)
+                        return null;
+
+                    if (agreed == null)
+                        agreed = viaInput;
+                    else if (!ReferenceEquals(agreed, viaInput) && agreed.FullName != viaInput.FullName)
+                        return null; // conflicting handles - do not invent a winner
+                }
+
+                return agreed;
+            }
+
+            if (instruction.OpCode != OpCode.Move || instruction.Operands.Count < 2)
+                return null;
 
             // only the first definition counts - a phi or a second definition means we cannot say
             if (instruction.Operands[1] is MemoryOperand { Index: null, Scale: 0, Addend: 0 } memory
@@ -458,6 +521,43 @@ public static class LocalVariables
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Diagnostic only: names the shape of the first definition of <paramref name="local"/> so the
+    /// sfdiag histogram classifies why <see cref="FindClassHandleOwner"/> failed, instead of us
+    /// guessing from a small biased sample.
+    /// </summary>
+    private static string ClassifyBaseDef(MethodAnalysisContext method, LocalVariable local)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.Operands.Count == 0 || instruction.Operands[0] is not LocalVariable dst || dst.Name != local.Name)
+                continue;
+
+            if (instruction.OpCode != OpCode.Move)
+                return "first_def_is_" + instruction.OpCode;
+
+            if (instruction.Operands.Count < 2)
+                return "move_without_source";
+
+            return instruction.Operands[1] switch
+            {
+                MemoryOperand { Index: not null } => "move_deref_indexed",
+                MemoryOperand { Scale: not 0 } => "move_deref_scaled",
+                MemoryOperand { Addend: not 0 } => "move_deref_with_addend",
+                MemoryOperand { Base: LocalVariable { Type: RuntimeMethodInfoAnalysisContext } } => "move_deref_of_methodinfo",
+                MemoryOperand { Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext } } => "move_deref_of_classhandle_but_untyped_dst",
+                MemoryOperand { Base: LocalVariable { Type: null } } => "move_deref_of_untyped_base",
+                MemoryOperand { Base: LocalVariable { Type: not null } } => "move_deref_of_other_typed",
+                MemoryOperand { Base: not LocalVariable } => "move_deref_of_non_local",
+                LocalVariable { Type: RuntimeClassTypeAnalysisContext } => "move_from_classhandle_local",
+                LocalVariable => "move_from_local",
+                _ => "move_from_" + instruction.Operands[1].GetType().Name,
+            };
+        }
+
+        return "no_local_def";
     }
 
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
