@@ -89,7 +89,7 @@ public static class AttributeInjectionUtils
         });
     }
 
-    private static void ApplyAttributeUsageAttribute(ApplicationAnalysisContext appContext, MultiAssemblyInjectedType multiAssemblyInjectedType, AttributeTargets attributeTargets, bool allowMultiple)
+    public static void ApplyAttributeUsageAttribute(ApplicationAnalysisContext appContext, MultiAssemblyInjectedType multiAssemblyInjectedType, AttributeTargets attributeTargets, bool allowMultiple)
     {
         var mscorlibAssembly = appContext.GetAssemblyByName("mscorlib") ?? throw new("Could not find mscorlib");
         var targetsEnumType = GetAttributeTargetsType(mscorlibAssembly);

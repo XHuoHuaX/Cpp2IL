@@ -242,7 +242,16 @@ public abstract class HasCustomAttributes(uint token, ApplicationAnalysisContext
             var attributeTypeContext = AppContext.ResolveContextForType(typeDef) ?? throw new("Unable to find type " + typeDef.FullName);
 
             AnalyzedCustomAttribute attribute;
-            if (attributeTypeContext.Methods.FirstOrDefault(c => c.Name == ".ctor" && c.Parameters.Count == 0) is { } constructor)
+            // Only a PUBLIC parameterless constructor can be emitted as a bare `[Attr]` application. Picking a
+            // non-public one (very common: attribute classes expose a protected parameterless ctor plus a
+            // public one with required arguments) makes IsSuitableForEmission true and emits an attribute
+            // usage that C# rejects with CS0122 ("inaccessible"). Falling through to the any-constructor
+            // branch marks it unsuitable, so AttributeInjectorProcessingLayer replaces it with an injected
+            // AttributeAttribute(Type, RVA, Offset) - which compiles and honestly records that the
+            // constructor arguments could not be recovered (metadata < 29 cannot read them).
+            if (attributeTypeContext.Methods.FirstOrDefault(c => c.Name == ".ctor"
+                    && c.Parameters.Count == 0
+                    && (c.Attributes & System.Reflection.MethodAttributes.MemberAccessMask) == System.Reflection.MethodAttributes.Public) is { } constructor)
             {
                 attribute = new(constructor);
             }

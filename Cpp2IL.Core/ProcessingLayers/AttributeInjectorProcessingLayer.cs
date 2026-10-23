@@ -153,6 +153,12 @@ public class AttributeInjectorProcessingLayer : Cpp2IlProcessingLayer
 
         var attributeAttributes = appContext.InjectTypeIntoAllAssemblies("Cpp2ILInjected", "AttributeAttribute", appContext.SystemTypes.SystemAttributeType);
 
+        // This attribute is emitted once PER original attribute, so a member with two attributes of
+        // the same (or even different) types carries two of them. Without an explicit
+        // [AttributeUsage(AllowMultiple = true)] the injected type defaults to AllowMultiple = false
+        // and the C# compiler rejects every second occurrence with CS0579 ("attribute repeated").
+        AttributeInjectionUtils.ApplyAttributeUsageAttribute(appContext, attributeAttributes, AttributeTargets.All, true);
+
         var attributeTypeFields = attributeAttributes.InjectFieldToAllAssemblies("Type", appContext.SystemTypes.SystemTypeType, FieldAttributes.Public);
         var attributeRvaFields = attributeAttributes.InjectFieldToAllAssemblies("RVA", appContext.SystemTypes.SystemStringType, FieldAttributes.Public);
         var attributeOffsetFields = attributeAttributes.InjectFieldToAllAssemblies("Offset", appContext.SystemTypes.SystemStringType, FieldAttributes.Public);
