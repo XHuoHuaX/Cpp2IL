@@ -155,13 +155,34 @@ public static class ArrayRecovery
 
     private static void RecoverAllocation(Instruction instruction)
     {
-        // Call "SzArrayNew", result, typeof(T[]), length, ...
-        if (!instruction.IsCall || instruction.Operands is not [StringLiteral { Value: var name }, LocalVariable result, TypeAnalysisContext type, { } length, ..]
-            || !ArrayNewFunctions.Contains(name))
+        // Call "SzArrayNew", result, type, length, ...
+        if (!instruction.IsCall || instruction.Operands.Count < 4)
+            return;
+
+        if (instruction.Operands[0] is not StringLiteral { Value: var name } || !ArrayNewFunctions.Contains(name))
+            return;
+
+        if (instruction.Operands[1] is not LocalVariable result)
+            return;
+
+        // The type operand reaches us in two shapes. Usually it is a TypeAnalysisContext, but on the
+        // metadata-24.x ARM64 codegen it is a LOAD through the array's class handle:
+        //     Call "SzArrayNew", v62, [v60 @ X8 (Il2CppClass<System.Byte[]>)], length, ...
+        // The strict pattern rejected that form, so the call was never rewritten to NewArr and IL
+        // generation later reported "Unknown call target operand: SzArrayNew" (576 methods).
+        var type = instruction.Operands[2] switch
+        {
+            TypeAnalysisContext direct => direct,
+            MemoryOperand { Index: null, Scale: 0, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var viaLoad } } } => viaLoad,
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var viaLocal } } => viaLocal,
+            _ => null
+        };
+
+        if (type == null)
             return;
 
         instruction.OpCode = OpCode.NewArr;
-        instruction.SetOperands(result, type, length);
+        instruction.SetOperands(result, type, instruction.Operands[3]);
 
         if (result.Type is not SzArrayTypeAnalysisContext)
             result.Type = type;
