@@ -90,7 +90,15 @@ public static class LocalVariables
         if (!method.IsStatic && method.Locals.Count > 0 && method.ParameterOperands.Count > 0)
         {
             var thisOperand = (Register)method.ParameterOperands[0];
-            var thisLocal = method.Locals.FirstOrDefault(l => l.Register.Number == thisOperand.Number && l.Register.Version == -1);
+            var thisLocal = method.Locals.FirstOrDefault(l => l.Register.Number == thisOperand.Number && l.Register.Version == -1)
+                            // SSA does not always keep the entry value at version -1 (a method that
+                            // overwrites its own `this` register, or a differing initial version, leaves
+                            // no -1 local). Falling back is only safe when the register number identifies
+                            // exactly one local - then it must be the parameter and cannot be a
+                            // re-assignment. Ambiguous cases keep the warning rather than guessing.
+                            ?? (method.Locals.Count(l => l.Register.Number == thisOperand.Number) == 1
+                                ? method.Locals.First(l => l.Register.Number == thisOperand.Number)
+                                : null);
 
             if (thisLocal != null)
             {
