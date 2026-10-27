@@ -39,6 +39,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     // [0]=clean [1]=placeholder [2]=analysis exception [3]=skipped engine assembly
     private readonly ConcurrentDictionary<string, int[]> _perAssembly = new();
     private readonly ConcurrentBag<string> _issues = new(); // "reason\tassembly\tmethod\tdetail"
+    private readonly ConcurrentBag<string> _issueCounts = new(); // "count\treason\tassembly\tmethod\tdetail"
     private int _clean, _placeholder, _exception, _skipped;
 
     // ---- address diagnostics: is a "Unmanaged memory load: [ADDR]" address a real metadata-usage slot? ----
@@ -67,6 +68,11 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     private readonly ConcurrentDictionary<string, int> _ubConstAddrKnown = new(); // of the above: known metadata global?
     private int _ubTotal, _ubConstTotal, _ubConstKnownTotal;
 
+    // "Method ends with non empty stack" methods, with their native address, so the prologue/epilogue can
+    // be read back from the binary and compared with what the lifter emitted.
+    private static readonly Regex NonEmptyStack = new(@"ends with non empty stack", RegexOptions.Compiled);
+    private readonly ConcurrentBag<string> _stackUnderflow = new();
+
     // Optional targeted ISIL dump for a name filter (env CPP2IL_DUMP_ISIL_FOR, ';'-separated substrings).
     // Used to obtain exact ground truth for a handful of failing methods without a full 450MB ISIL dump.
     private static readonly string[] IsilDumpFilter =
@@ -83,8 +89,21 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             ? new Regex(issuePattern, RegexOptions.Compiled)
             : null;
 
+    // Debug-only: analyse a single method (substring of its full name) so a fix can be iterated on in
+    // seconds instead of a ~25 minute full run. Every other method is emitted as a stub, unanalysed.
+    private static readonly string? OnlyMethodFilter =
+        (Environment.GetEnvironmentVariable("CPP2IL_ONLY_METHOD") ?? "") is { Length: > 0 } only ? only : null;
+
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
+        // Fast path for single-method debugging: don't even analyse the rest.
+        if (OnlyMethodFilter != null
+            && !methodContext.FullName.Contains(OnlyMethodFilter, StringComparison.Ordinal))
+        {
+            FillMethodBodyWithStub(methodDefinition);
+            return;
+        }
+
         // The base releases ISIL/CFG at the end of its FillMethodBody. Because our diagnostics need
         // the CFG (to walk a placeholder's operand provenance), BuildAssemblies defers that release
         // and we drop it here in a finally - retention stays bounded to one method at a time.
@@ -110,7 +129,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                 return;
             }
 
-            var (reason, detail) = FindIssue(body);
+            var (reason, detail) = FindIssue(body, out var issueCount);
 
             if (reason == null)
             {
@@ -121,6 +140,13 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
             Interlocked.Increment(ref slot[reason == "placeholder" ? 1 : 2]);
             _issues.Add($"{reason}\t{assemblyName}\t{methodContext.FullName}\t{Flatten(detail)}");
+
+            // How far each body is from clean: a body needs ALL of its issues gone to count, so the
+            // methods sitting at one issue are where the next gain actually is.
+            _issueCounts.Add($"{issueCount}\t{reason}\t{assemblyName}\t{methodContext.FullName}\t{Flatten(detail)}");
+
+            if (NonEmptyStack.IsMatch(detail))
+                _stackUnderflow.Add($"{methodContext.FullName}\t0x{methodContext.UnderlyingPointer:X}\t{Flatten(detail)}");
 
             if (reason == "placeholder")
             {
@@ -399,15 +425,19 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     /// </summary>
     private void MaybeDumpIsil(MethodAnalysisContext methodContext, string detail)
     {
-        if ((IsilDumpFilter.Length == 0 && IsilDumpIssueFilter == null) || _isilDumped >= 40)
+        var fullName = methodContext.FullName;
+
+        // single-method debug mode implies "dump it"
+        var byOnly = OnlyMethodFilter != null && fullName.Contains(OnlyMethodFilter, StringComparison.Ordinal);
+
+        if (!byOnly && ((IsilDumpFilter.Length == 0 && IsilDumpIssueFilter == null) || _isilDumped >= 40))
             return;
 
-        var fullName = methodContext.FullName;
         var byName = IsilDumpFilter.Length > 0
                      && IsilDumpFilter.Any(f => fullName.Contains(f, StringComparison.Ordinal));
         var byIssue = IsilDumpIssueFilter?.IsMatch(detail) == true;
 
-        if (!byName && !byIssue)
+        if (!byOnly && !byName && !byIssue)
             return;
 
         Interlocked.Increment(ref _isilDumped);
@@ -415,6 +445,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"===== {methodContext.DeclaringType?.DeclaringAssembly?.Name} :: {fullName}");
         sb.AppendLine($"first issue: {detail}");
+        sb.AppendLine($"native address: 0x{methodContext.UnderlyingPointer:X} (rva 0x{methodContext.Rva:X})");
         sb.AppendLine("globals/locals:");
 
         foreach (var l in methodContext.Locals.OrderBy(l => l.Name, StringComparer.Ordinal))
@@ -430,6 +461,12 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         else
         {
             sb.AppendLine("instructions: <no CFG>");
+        }
+
+        if (Cpp2IL.Core.Analysis.StackAnalyzer.LastAnalysisTrace is { } trace)
+        {
+            sb.AppendLine(trace);
+            Cpp2IL.Core.Analysis.StackAnalyzer.LastAnalysisTrace = null;
         }
 
         _isilDump.Add(sb.ToString());
@@ -514,8 +551,25 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     ///  - "exception":   the base class replaced the body with ldstr detail; newobj Exception; throw.
     /// </summary>
     private static (string? Reason, string Detail) FindIssue(CilMethodBody body)
+        => FindIssue(body, out _);
+
+    /// <summary>
+    /// Classifies a method body and also reports <paramref name="issueCount"/>: how many
+    /// <c>NoteDecompilerIssue</c> calls the body carries.
+    /// </summary>
+    /// <remarks>
+    /// The count matters because the headline metric is all-or-nothing per method: a body is only clean
+    /// when it carries none. A change that eliminates one issue kind therefore only moves the metric
+    /// when it happens to be the LAST issue in a method, so knowing the per-method count (and which
+    /// kinds remain in the methods sitting at one) is what tells us where the next real gain is.
+    /// </remarks>
+    private static (string? Reason, string Detail) FindIssue(CilMethodBody body, out int issueCount)
     {
         var ins = body.Instructions;
+
+        issueCount = 0;
+        var firstDetail = "";
+        var found = false;
 
         for (var i = 0; i < ins.Count; i++)
         {
@@ -524,11 +578,19 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             if (md.Name != NoteIssueMethodName)
                 continue;
 
-            var detail = i > 0 && ins[i - 1].OpCode.Code == CilCode.Ldstr && ins[i - 1].Operand is string s
+            issueCount++;
+
+            if (found)
+                continue;
+
+            found = true;
+            firstDetail = i > 0 && ins[i - 1].OpCode.Code == CilCode.Ldstr && ins[i - 1].Operand is string s
                 ? s
                 : "";
-            return ("placeholder", detail);
         }
+
+        if (found)
+            return ("placeholder", firstDetail);
 
         // Analysis-exception stub: ldstr <reason>; newobj System.Exception; throw
         if (ins.Count >= 3
@@ -586,8 +648,21 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             File.WriteAllLines(issuesPath, new[] { "reason\tassembly\tmethod\tdetail" }
                 .Concat(_issues.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)));
 
+            var countsPath = Path.Combine(root, "dll_il_recovery_safe.issuecounts.tsv");
+            File.WriteAllLines(countsPath, new[] { "issueCount\treason\tassembly\tmethod\tfirstDetail" }
+                .Concat(_issueCounts.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)));
+
             Logger.InfoNewline($"[IlRecoverySafe] summary: {summary}", "IlRecoverySafe");
             Logger.InfoNewline($"[IlRecoverySafe] issues : {issuesPath}", "IlRecoverySafe");
+            Logger.InfoNewline($"[IlRecoverySafe] counts : {countsPath}", "IlRecoverySafe");
+
+            if (_stackUnderflow.Count > 0)
+            {
+                var stackPath = Path.Combine(root, "dll_il_recovery_safe.stackunderflow.tsv");
+                File.WriteAllLines(stackPath, new[] { "method\tnativeAddr\tdetail" }
+                    .Concat(_stackUnderflow.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)));
+                Logger.InfoNewline($"[IlRecoverySafe] stackunderflow ({_stackUnderflow.Count}): {stackPath}", "IlRecoverySafe");
+            }
 
             ReportAddressDiagnostics(root);
         }
@@ -610,27 +685,30 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             "IlRecoverySafe");
 
         var top = _addrDelta.OrderByDescending(kv => kv.Value).Take(20).ToList();
-        if (top.Count == 0)
-            return;
 
-        var lines = new List<string> { "delta_to_nearest_slot\tcount\tpage_aligned" };
-        foreach (var (delta, count) in top)
+        // Note: no early return when there is nothing to report here - the remaining diagnostics (and
+        // the ISIL dump) live further down and used to be skipped whenever this one was empty.
+        if (top.Count > 0)
         {
-            var aligned = delta != 0 && delta % 0x1000 == 0;
-            lines.Add($"{(delta < 0 ? "-" : "+")}0x{Math.Abs(delta):X}\t{count}\t{aligned}");
-            Logger.InfoNewline($"[IlRecoverySafe][addr] delta={(delta < 0 ? "-" : "+")}0x{Math.Abs(delta):X} " +
-                               $"x{count} pageAligned={aligned}", "IlRecoverySafe");
-        }
+            var lines = new List<string> { "delta_to_nearest_slot\tcount\tpage_aligned" };
+            foreach (var (delta, count) in top)
+            {
+                var aligned = delta != 0 && delta % 0x1000 == 0;
+                lines.Add($"{(delta < 0 ? "-" : "+")}0x{Math.Abs(delta):X}\t{count}\t{aligned}");
+                Logger.InfoNewline($"[IlRecoverySafe][addr] delta={(delta < 0 ? "-" : "+")}0x{Math.Abs(delta):X} " +
+                                   $"x{count} pageAligned={aligned}", "IlRecoverySafe");
+            }
 
-        try
-        {
-            var path = Path.Combine(root, "dll_il_recovery_safe.addrtest.tsv");
-            File.WriteAllLines(path, lines);
-            Logger.InfoNewline($"[IlRecoverySafe] addrtest: {path}", "IlRecoverySafe");
-        }
-        catch (Exception e)
-        {
-            Logger.ErrorNewline($"[IlRecoverySafe] failed to write addrtest: {e.Message}", "IlRecoverySafe");
+            try
+            {
+                var path = Path.Combine(root, "dll_il_recovery_safe.addrtest.tsv");
+                File.WriteAllLines(path, lines);
+                Logger.InfoNewline($"[IlRecoverySafe] addrtest: {path}", "IlRecoverySafe");
+            }
+            catch (Exception e)
+            {
+                Logger.ErrorNewline($"[IlRecoverySafe] failed to write addrtest: {e.Message}", "IlRecoverySafe");
+            }
         }
 
         ReportMethodNotFoundDiagnostics(root);

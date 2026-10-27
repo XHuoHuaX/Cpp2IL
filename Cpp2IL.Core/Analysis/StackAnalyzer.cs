@@ -29,9 +29,12 @@ public class StackAnalyzer
     {
         var analyzer = new StackAnalyzer();
 
+        LastAnalysisTrace = null; // never let a previous method's trace be attributed to this one
+
         var graph = method.ControlFlowGraph!;
         graph.RemoveUnreachableBlocks(); // Without this indirect jumps (in try catch i think) cause some weird stuff
 
+        analyzer._method = method;
         analyzer._inComingState = new Dictionary<Block, StackState> { { graph.EntryBlock, new StackState() } };
 
         analyzer.TraverseGraph(graph.EntryBlock);
@@ -42,6 +45,9 @@ public class StackAnalyzer
         {
             var outText = outDelta.Size < 0 ? "-" + (-outDelta.Size).ToString("X") : outDelta.Size.ToString("X");
             method.AddWarning($"Method ends with non empty stack ({outText}), the output could be wrong!");
+
+            if (System.Environment.GetEnvironmentVariable("CPP2IL_STACK_DEBUG") == "1")
+                LastAnalysisTrace = BuildTrace(graph, analyzer);
         }
 
         analyzer.ResolveFrameAliases(graph);
@@ -175,6 +181,14 @@ public class StackAnalyzer
             if (block.BlockType == BlockType.TailCall)
                 currentState.Size = 0;
 
+            // A block ending in `call <unresolved native target>; ret` is a noreturn call - in IL2CPP
+            // that is the cold path of a null check, which calls a throw helper and therefore never
+            // gives the frame back. Its (correctly) negative depth must not poison the method's final
+            // balance check. Slot names inside the block were already computed above, so nothing but
+            // the end-of-method comparison is affected.
+            if (EndsInUnresolvedCallThenReturn(block))
+                currentState.Size = 0;
+
             _outGoingState[block] = currentState;
 
             visitedBlockCount++;
@@ -202,6 +216,92 @@ public class StackAnalyzer
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Debug-only: a per-block dump of the simulated frame size, written when
+    /// <c>CPP2IL_STACK_DEBUG=1</c> and the method ends unbalanced. Lets a single method be compared
+    /// against the real prologue/epilogue instead of guessing which instruction lost its ShiftStack.
+    /// </summary>
+    public static string? LastAnalysisTrace;
+
+    private MethodAnalysisContext? _method;
+
+    /// <summary>
+    /// True when the block's last real instruction is <c>Return</c> and the one before it calls a target
+    /// that is not a known managed method. IL2CPP emits such blocks for the cold path of a null check
+    /// (<c>cbz x0, &lt;cold&gt;</c> ... <c>ret</c> ... <c>cold: bl &lt;throw helper&gt;</c>) where the helper
+    /// never returns, so the frame is never restored. Managed calls also carry their target as an
+    /// immediate, hence the "not in MethodsByAddress" test.
+    /// </summary>
+    private bool EndsInUnresolvedCallThenReturn(Block block)
+    {
+        var instructions = block.Instructions;
+        if (instructions.Count == 0)
+            return false;
+
+        // Shape 1: `call ...; ret` still inside one block.
+        if (instructions[^1].OpCode == OpCode.Return)
+        {
+            for (var i = instructions.Count - 2; i >= 0; i--)
+            {
+                if (instructions[i].OpCode == OpCode.Nop)
+                    continue;
+
+                return IsUnresolvedCall(instructions[i]);
+            }
+
+            return false;
+        }
+
+        // Shape 2: the CFG splits a block after every call, so the call is the block terminator and the
+        // Return is the sole instruction of its successor.
+        return IsUnresolvedCall(instructions[^1])
+               && block.Successors.Count == 1
+               && block.Successors[0].Instructions is [var only]
+               && only.OpCode == OpCode.Return;
+    }
+
+    /// <summary>
+    /// A call whose target is not a known managed method. Managed calls also carry their target as an
+    /// immediate, hence the lookup - an unresolved target means native/helper code whose return
+    /// convention we cannot model.
+    /// </summary>
+    private bool IsUnresolvedCall(Instruction instruction)
+    {
+        if (instruction.OpCode is not (OpCode.Call or OpCode.CallVoid))
+            return false;
+
+        if (instruction.Operands.Count == 0 || instruction.Operands[0] is not Immediate target)
+            return false;
+
+        return _method != null && !_method.AppContext.MethodsByAddress.ContainsKey(target.UnsignedValue);
+    }
+
+    private static string BuildTrace(ISILControlFlowGraph graph, StackAnalyzer analyzer)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("stack trace (in/out frame size per block):");
+
+        foreach (var block in graph.Blocks)
+        {
+            var ins = block.Instructions;
+            if (ins.Count == 0)
+                continue;
+
+            var first = ins[0];
+            var last = ins[^1];
+            var incoming = analyzer._inComingState.TryGetValue(block, out var i) ? i.Size : int.MinValue;
+            var outgoing = analyzer._outGoingState.TryGetValue(block, out var o) ? o.Size : int.MinValue;
+
+            sb.AppendLine($"    block #{block.ID} [{first.Index}..{last.Index}] in={incoming:X8} out={outgoing:X8} " +
+                          $"type={block.BlockType} succ=[{string.Join(",", block.Successors.Select(s => s.ID))}] " +
+                          $"preds=[{string.Join(",", block.Predecessors.Select(s => s.ID))}]");
+            foreach (var instruction in ins)
+                sb.AppendLine($"        {instruction.Index}: {instruction}");
+        }
+
+        return sb.ToString();
     }
 
     private static void ReplaceStackWithRegisters(MethodAnalysisContext method)
