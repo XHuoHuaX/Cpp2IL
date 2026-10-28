@@ -18,6 +18,29 @@ public static class IlGenerator
     private const string HelpersTypeName = "Cpp2ILHelpers";
     private const string NoteIssueMethodName = "NoteDecompilerIssue";
 
+    /// <summary>
+    /// False when <paramref name="type"/> is a generic parameter that the emitting method cannot name:
+    /// IL2CPP shares generic method bodies, so a body recovered for a concrete method can still be
+    /// written in terms of the shared definition's type or method parameters. Emitting those produces
+    /// identifiers that do not resolve (CS0246 / CS7003), so callers substitute <c>object</c> instead.
+    /// Ownership is compared by identity on purpose: matching on the index alone would silently bind the
+    /// parameter to a different owner's parameter, which is a wrong value rather than a degrade.
+    /// </summary>
+    private static bool IsInScopeGenericParameter(MethodAnalysisContext context, TypeAnalysisContext type)
+    {
+        if (type is not GenericParameterTypeAnalysisContext parameter)
+            return true;
+
+        if (parameter.Type == LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_MVAR)
+            return ReferenceEquals(parameter.Owner, context);
+
+        for (var declaring = context.DeclaringType; declaring != null; declaring = declaring.DeclaringType)
+            if (ReferenceEquals(parameter.Owner, declaring))
+                return true;
+
+        return false;
+    }
+
     public static void InjectHelpersType(ApplicationAnalysisContext appContext)
     {
         var helpersType = appContext.InjectTypeIntoAllAssemblies(
@@ -107,7 +130,12 @@ public static class IlGenerator
             TypeSignature ilType;
 
             // Use object if type couldn't be determined, or if it's void, which no locals sig can hold
-            if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
+            // A local may also be typed by a generic parameter the emitting method does not declare:
+            // IL2CPP shares generic bodies, so those leak into concrete methods and would emit an
+            // identifier that does not resolve (CS0246). Degrade to object, which compiles and leaves
+            // the control flow intact.
+            if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType
+                                    && IsInScopeGenericParameter(context, local.Type))
                 ilType = local.Type.ToTypeSignature();
             else
                 ilType = module.CorLibTypeFactory.Object;
