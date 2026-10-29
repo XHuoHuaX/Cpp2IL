@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
@@ -7,6 +8,60 @@ namespace Cpp2IL.Core.Utils.AsmResolver;
 
 public static class ContextToMethodDescriptor
 {
+    /// <summary>
+    /// A call whose receiver is a generic *instance* has to be emitted against that instance. Emitting
+    /// the definition instead produces <c>call List`1::Add(!0)</c>, which C# cannot express at all;
+    /// ILSpy then renders the definition's own parameter name at the call site, which resolves to
+    /// nothing (CS0246 on T/TKey/TValue, plus argument types that no longer match).
+    /// </summary>
+    public static IMethodDescriptor ToMethodDescriptorOnInstance(this MethodAnalysisContext context,
+        GenericInstanceTypeAnalysisContext receiverInstance)
+    {
+        var typeArguments = receiverInstance.GenericArguments.Select(a => a.ToTypeSignature()).ToArray();
+
+        var returnType = Substitute(context.ReturnType.ToTypeSignature(), typeArguments);
+        var parameters = context.Parameters.Select(p => Substitute(p.ParameterType.ToTypeSignature(), typeArguments));
+
+        var signature = context.IsStatic
+            ? MethodSignature.CreateStatic(returnType, context.GenericParameters.Count, parameters)
+            : MethodSignature.CreateInstance(returnType, context.GenericParameters.Count, parameters);
+
+        var reference = new MemberReference(receiverInstance.ToTypeSignature().ToTypeDefOrRef(), context.Name, signature);
+
+        if (context.GenericParameters.Count == 0)
+            return reference;
+
+        // A generic method reached through a generic instance: close it with constraint-safe placeholders,
+        // same rule as everywhere else (never invent a concrete type).
+        var methodArguments = context.GenericParameters
+            .Select(p => PlaceholderForGenericParameter(context.AppContext, p).ToTypeSignature())
+            .ToArray();
+
+        return reference.MakeGenericInstanceMethod(methodArguments);
+    }
+
+    /// <summary>
+    /// Replace type-level generic parameters with the arguments of the instance they were reached
+    /// through. Recurses through the shapes a parameter can legitimately hide in.
+    /// </summary>
+    private static TypeSignature Substitute(TypeSignature signature, TypeSignature[] typeArguments) =>
+        signature switch
+        {
+            GenericParameterSignature { ParameterType: GenericParameterType.Type } parameter
+                when parameter.Index >= 0 && parameter.Index < typeArguments.Length
+                => typeArguments[parameter.Index],
+
+            SzArrayTypeSignature array => new SzArrayTypeSignature(Substitute(array.BaseType, typeArguments)),
+            ByReferenceTypeSignature byReference => new ByReferenceTypeSignature(Substitute(byReference.BaseType, typeArguments)),
+            PointerTypeSignature pointer => new PointerTypeSignature(Substitute(pointer.BaseType, typeArguments)),
+            GenericInstanceTypeSignature genericInstance => new GenericInstanceTypeSignature(
+                genericInstance.GenericType,
+                genericInstance.IsValueType,
+                genericInstance.TypeArguments.Select(a => Substitute(a, typeArguments))),
+
+            _ => signature
+        };
+
     private static MethodDefinition GetMethodDefinition(this MethodAnalysisContext context)
     {
         return context.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {context}");

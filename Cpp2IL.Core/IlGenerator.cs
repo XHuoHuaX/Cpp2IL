@@ -445,9 +445,19 @@ public static class IlGenerator
                     break;
                 }
 
+                var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
-                var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+                // A call on a generic type instance has to reference that instance - see FINDING-010.
+                // Emitting the definition yields `call List`1::Add(!0)`, which no C# compiler can express.
+                if (!targetMethod.IsStatic
+                    && instruction.Operands.Count > thisParamIndex
+                    && DestinationType(instruction.Operands[thisParamIndex]) is GenericInstanceTypeAnalysisContext receiverInstance
+                    && targetMethod.DeclaringType is { } callDeclaringType
+                    && callDeclaringType.GenericParameters.Count > 0
+                    && receiverInstance.GenericArguments.Count == callDeclaringType.GenericParameters.Count)
+                    importedMethod = targetMethod.ToMethodDescriptorOnInstance(receiverInstance);
 
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
