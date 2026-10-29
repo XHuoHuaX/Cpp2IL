@@ -135,6 +135,13 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
             {
                 Interlocked.Increment(ref slot[0]);
                 Interlocked.Increment(ref _clean);
+
+                // In single-method debug mode the whole point is to look at this method, so dump it
+                // even when it came out clean - a clean body can still be wrong (e.g. a mistyped
+                // operand that only shows up as a compile error after decompilation).
+                if (OnlyMethodFilter != null)
+                    MaybeDumpIsil(methodContext, "(clean method)");
+
                 return;
             }
 
