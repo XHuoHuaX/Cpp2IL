@@ -41,6 +41,25 @@ public static class IlGenerator
         return false;
     }
 
+    /// <summary>
+    /// Replace a type that cannot be named at this site with <c>object</c>. Two cases: a generic
+    /// parameter the method does not declare, and a generic instantiation that mentions one (a
+    /// <c>List&lt;T&gt;</c> is just as unspeakable as a bare <c>T</c>). Used wherever a type signature
+    /// reaches the output, not only local declarations - instruction operands carry types too.
+    /// </summary>
+    private static TypeAnalysisContext SanitizeType(MethodAnalysisContext context, TypeAnalysisContext type)
+    {
+        if (type is GenericParameterTypeAnalysisContext)
+            return IsInScopeGenericParameter(context, type) ? type : context.AppContext.SystemTypes.SystemObjectType;
+
+        if (type is GenericInstanceTypeAnalysisContext genericInstance)
+            foreach (var argument in genericInstance.GenericArguments)
+                if (!IsInScopeGenericParameter(context, argument))
+                    return context.AppContext.SystemTypes.SystemObjectType;
+
+        return type;
+    }
+
     public static void InjectHelpersType(ApplicationAnalysisContext appContext)
     {
         var helpersType = appContext.InjectTypeIntoAllAssemblies(
@@ -136,7 +155,7 @@ public static class IlGenerator
             // the control flow intact.
             if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType
                                     && IsInScopeGenericParameter(context, local.Type))
-                ilType = local.Type.ToTypeSignature();
+                ilType = SanitizeType(context, local.Type).ToTypeSignature();
             else
                 ilType = module.CorLibTypeFactory.Object;
 
@@ -333,7 +352,7 @@ public static class IlGenerator
                     LoadLocal(target.Array, method, locals);
                     LoadOperand(target.Index, method, locals, writeLine);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored);
-                    instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Stelem, SanitizeType(context, stored).ToTypeSignature().ToTypeDefOrRef());
                     break;
                 }
 
@@ -345,7 +364,7 @@ public static class IlGenerator
                 if (instruction.Operands is [_, SzArrayTypeAnalysisContext { ElementType: { } newArrayElement }, { } length])
                 {
                     LoadOperand(length, method, locals, writeLine);
-                    instructions.Add(CilOpCodes.Newarr, newArrayElement.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Newarr, SanitizeType(context, newArrayElement).ToTypeSignature().ToTypeDefOrRef());
                 }
                 else
                     instructions.Add(CilOpCodes.Ldnull);
@@ -388,7 +407,7 @@ public static class IlGenerator
                 {
                     // il2cpp_value_box takes the value by address, but IL boxes it by value
                     LoadOperand(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue, method, locals, writeLine, boxedType);
-                    instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Box, SanitizeType(context, boxedType).ToTypeSignature().ToTypeDefOrRef());
                 }
                 else
                     instructions.Add(CilOpCodes.Ldnull);

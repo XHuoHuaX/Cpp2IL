@@ -39,7 +39,6 @@ public static class ContextToMethodDescriptor
         if (genericParameterCount == 0)
             return definition;
 
-        var objectType = context.AppContext.SystemTypes.SystemObjectType;
         var memberReference = new MemberReference(
             context.DeclaringType?.ToTypeSignature().ToTypeDefOrRef(),
             context.Name,
@@ -47,9 +46,30 @@ public static class ContextToMethodDescriptor
 
         var arguments = new TypeSignature[genericParameterCount];
         for (var i = 0; i < arguments.Length; i++)
-            arguments[i] = objectType.ToTypeSignature();
+            arguments[i] = PlaceholderForGenericParameter(context.AppContext, context.GenericParameters[i]).ToTypeSignature();
 
         return memberReference.MakeGenericInstanceMethod(arguments);
+    }
+
+    /// <summary>
+    /// The type to use when a recovered generic argument is unknown. Prefer the parameter's own first
+    /// real constraint (a `where T : Component` style constraint), because instantiating with plain
+    /// <c>object</c> then fails with CS0311; fall back to <c>object</c>. This keeps the call valid
+    /// without inventing a specific type - the invented type would be a silent wrong value.
+    /// </summary>
+    private static TypeAnalysisContext PlaceholderForGenericParameter(ApplicationAnalysisContext appContext,
+        GenericParameterTypeAnalysisContext parameter)
+    {
+        foreach (var constraint in parameter.ConstraintTypes)
+        {
+            var name = constraint?.FullName;
+            if (name is null or "System.Object" or "System.ValueType" or "System.Enum")
+                continue;
+
+            return constraint;
+        }
+
+        return appContext.SystemTypes.SystemObjectType;
     }
 
     public static IMethodDescriptor ToMethodDescriptor(this ConcreteGenericMethodAnalysisContext context)
