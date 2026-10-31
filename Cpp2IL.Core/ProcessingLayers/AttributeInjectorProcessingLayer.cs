@@ -17,6 +17,20 @@ public class AttributeInjectorProcessingLayer : Cpp2IlProcessingLayer
 
     private static bool _useEzDiffMode;
 
+    /// <summary>
+    /// Attributes that C# reserves for the compiler: user code may not mention them, and mentioning one
+    /// is a hard error (CS8335, "do not use ...; it is reserved for compiler use"). IL still carries them,
+    /// because Roslyn synthesises them from ordinary syntax (`in` / `ref readonly` / `scoped`) and IL2CPP
+    /// copies whatever the IL says into metadata.
+    /// Emitting one therefore makes the rebuilt source unparsable, while dropping it is lossless: the
+    /// syntax that generated it regenerates it on the next compile. This is a language rule, not a
+    /// property of any particular game.
+    /// </summary>
+    private static readonly HashSet<string> CompilerReservedAttributes = new(StringComparer.Ordinal)
+    {
+        "System.Runtime.CompilerServices.IsReadOnlyAttribute",
+    };
+
     public override void Process(ApplicationAnalysisContext appContext, Action<int, int>? progressCallback = null)
     {
         //EZ diff mode removes token attributes and method address/rva fields to make diffing using e.g. git easier
@@ -185,9 +199,38 @@ public class AttributeInjectorProcessingLayer : Cpp2IlProcessingLayer
         }
     }
 
+    /// <summary>
+    /// Returns the name that <c>[DefaultMember]</c> must carry for <paramref name="context"/>, or null when
+    /// <paramref name="attribute"/> is not a DefaultMemberAttribute or the context is not a type with a
+    /// parameterized property (i.e. not an indexer at all).
+    /// The C# compiler only records the type's own indexer there; explicit interface implementations are named
+    /// <c>Ns.IFace.Item</c> and never become the default member.
+    /// </summary>
+    private static string? TryInferDefaultMemberName(AnalyzedCustomAttribute attribute, HasCustomAttributes context)
+    {
+        if (attribute.Constructor.DeclaringType?.FullName != "System.Reflection.DefaultMemberAttribute")
+            return null;
+
+        if (context is not TypeAnalysisContext typeContext)
+            return null;
+
+        var indexers = typeContext.Properties
+            .Where(p => (p.Getter?.Parameters.Count ?? 0) > 0 || (p.Setter?.Parameters.Count ?? 0) > 1)
+            .ToList();
+
+        return indexers.Count == 0 ? null : (indexers.FirstOrDefault(p => !p.Name.Contains('.')) ?? indexers[0]).Name;
+    }
+
     private static void ProcessCustomAttributesForContext(HasCustomAttributes context, FieldAnalysisContext typeField, FieldAnalysisContext rvaField, FieldAnalysisContext offsetField, MethodAnalysisContext ctor)
     {
         var seenReplacements = new HashSet<string>(StringComparer.Ordinal);
+        // A bare [Attr] cannot express "twice": C# only permits a repeated attribute when the attribute
+        // type opts into AllowMultiple, which a parameterless-ctor attribute effectively never does.
+        // IL2CPP metadata can still list the same attribute twice on one member - the game's own C#
+        // did not, so the duplicate comes from attribute-generator resolution - and the C# compiler
+        // then rejects the whole assembly with CS0579. That is a declaration-phase error, which also
+        // silences every method body of the assembly (docs/FINDING-012), so it must not be left in.
+        var seenPlainAttributes = new HashSet<string>(StringComparer.Ordinal);
 
         if (_useEzDiffMode)
             context.CustomAttributes = [];
@@ -203,9 +246,40 @@ public class AttributeInjectorProcessingLayer : Cpp2IlProcessingLayer
         {
             var attribute = context.CustomAttributes[index];
 
-            if (attribute.IsSuitableForEmission)
-                //Attribute has all required parameters, so we don't need an injected one
+            if (CompilerReservedAttributes.Contains(attribute.Constructor.DeclaringType?.FullName ?? string.Empty))
+            {
+                context.CustomAttributes.RemoveAt(index);
+                index--;
                 continue;
+            }
+
+            if (attribute.IsSuitableForEmission)
+            {
+                //Attribute has all required parameters, so we don't need an injected one
+                if (!attribute.HasAnyParameters && !attribute.AnyFieldsOrPropsSet
+                                                   && attribute.Constructor.DeclaringType != null
+                                                   && !seenPlainAttributes.Add(attribute.Constructor.DeclaringType.FullName!))
+                {
+                    context.CustomAttributes.RemoveAt(index);
+                    index--;
+                }
+
+                continue;
+            }
+
+            //DefaultMemberAttribute has exactly one ctor parameter - the default member name - and no
+            //parameterless ctor, so pre-29 metadata (which cannot read attribute blobs) always flattens it
+            //into AttributeAttribute(Type, RVA, Offset). That placeholder carries no name, so no decompiler
+            //can tell a parameterized property from an ordinary method: ILSpy gives up with
+            //"C# has no syntax for parameterized property" and emits get_Item/set_Item, which then fails to
+            //implement IEnumerable/IList/IDictionary indexers (CS0535/CS0683/CS0470).
+            //The name is not a guess: the C# compiler writes [DefaultMember(X)] where X is the indexer's own
+            //name, and IL2CPP keeps every property, so it is read back from the declaring type.
+            if (attribute.ConstructorParameters.Count == 0 && TryInferDefaultMemberName(attribute, context) is { } defaultMemberName)
+            {
+                attribute.ConstructorParameters.Add(new CustomAttributePrimitiveParameter(defaultMemberName, attribute, CustomAttributeParameterKind.ConstructorParam, 0));
+                continue;
+            }
 
             //Get ptr, and from it, rva and offset
             var generatorPtr = context.CaCacheGeneratorAnalysis!.UnderlyingPointer;
