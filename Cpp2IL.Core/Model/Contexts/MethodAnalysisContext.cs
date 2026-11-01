@@ -438,6 +438,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // several definitions merging at a join here, so this pass propagates conservatively), then
         // drop dead locals.
         Simplifier.Simplify(this);
+        // `GetTypeFromHandle(<runtime class ptr>)` is exactly `typeof(T)`; folding it also removes the
+        // pointer-typed local behind it, which the emitter can only render as `(IntPtr)typeof(T)`.
+        TypeofFromHandleFolder.Run(this);
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
