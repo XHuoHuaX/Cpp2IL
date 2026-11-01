@@ -5,6 +5,7 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -375,7 +376,51 @@ public static class IlGenerator
             case OpCode.Newobj:
                 // Try and fuse our Newobj + the follow up constructor CallVoid into one IL newobj.
                 // If we can't, just fall back to an Ldnull.
-                if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
+                //
+                // A delegate is the other shape, and it needs different handling: IL2CPP allocates the
+                // delegate type and carries the target method in a neighbouring `Move methodof(M)`. Both
+                // halves are present, so the target is known - dropping it leaves `new D(this, (IntPtr)0)`,
+                // a delegate that points nowhere (a fake value, red line C5) and not valid C# either
+                // (CS0149). The structural signal is used rather than the delegate type's base chain,
+                // because allocations routinely name the generic *definition* whose base is unresolved.
+                if (instruction.Operands is [_, TypeAnalysisContext { } delegateType, ..]
+                    && FindDelegateTarget(context, instruction) is { } delegateTargetMove
+                    && delegateTargetMove.Operands[1] is RuntimeMethodInfoAnalysisContext delegateTarget
+                    && FindDelegateCtor(delegateType) is { } delegateCtor
+                    && IsEmittableDelegateTarget(context, delegateTarget.RepresentedMethod))
+                {
+                    // IL2CPP creates a delegate as "allocate the delegate type" plus a separate
+                    // `Move <local>, methodof(M)` carrying the MethodInfo. Both halves are present, so the
+                    // target method is known - dropping it would leave `new D(this, (IntPtr)0)`, a delegate
+                    // that points nowhere (a fake value, red line C5) and not valid C# either (CS0149).
+                    // Emit the real thing: ldarg.0/ldnull, ldftn M, newobj D::.ctor(object, native int).
+                    var delegateTargetMethod = delegateTarget.RepresentedMethod;
+
+                    // The MethodInfo load has been folded into the ldftn below; leaving it would emit a
+                    // method-pointer local that can only be rendered as a fake `(IntPtr)0`.
+                    delegateTargetMove.OpCode = OpCode.Nop;
+                    delegateTargetMove.SetOperands();
+
+                    if (delegateTargetMethod.IsStatic)
+                        instructions.Add(CilOpCodes.Ldnull);
+                    else
+                        LoadOperand(context.Locals.First(l => l.IsThis), method, locals, writeLine);
+
+                    instructions.Add(CilOpCodes.Ldftn, delegateTargetMethod.ToMethodDescriptor());
+                    instructions.Add(CilOpCodes.Newobj, delegateCtor);
+
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+
+                    // The ctor call that IL2CPP emitted alongside the allocation is now part of the
+                    // `newobj` above, so it must not be emitted again (it would become an `_002Ector` call
+                    // on the finished delegate, taking the dropped MethodInfo pointer).
+                    if (FindConstructorCall(context, instruction) is { } consumedCtor)
+                    {
+                        consumedCtor.OpCode = OpCode.Nop;
+                        consumedCtor.SetOperands();
+                    }
+                }
+                else if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
                 {
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
@@ -640,6 +685,108 @@ public static class IlGenerator
     }
     
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
+
+    /// <summary>
+    /// Whether the delegate's target method can be named in emitted IL at all. Two shapes cannot, and
+    /// fabricating something for them is worse than leaving the site degraded (red line C5):
+    /// <list type="bullet">
+    /// <item>a method declared on a <em>generic instance</em> - <c>ToMethodDescriptor</c> yields an
+    /// unresolvable reference, which ILSpy renders as the pseudo-call <c>__ldftn(...)</c>;</item>
+    /// <item>an <em>instance</em> method while the enclosing method has no <c>this</c> (a lambda lifted into
+    /// a static context) - the receiver would have to be invented, and a null receiver produces code that
+    /// does not compile (<c>CS0120</c>).</item>
+    /// </list>
+    /// </summary>
+    private static bool IsEmittableDelegateTarget(MethodAnalysisContext context, MethodAnalysisContext target)
+    {
+        if (target.DeclaringType is GenericInstanceTypeAnalysisContext)
+            return false;
+
+        // A compiler-generated method (`<Method>b__0`, `<>9__32_0`) is the lambda body the C# compiler
+        // synthesised for a source-level lambda. Naming it with ldftn makes ILSpy inline it as a lambda,
+        // and it then emits that method's own attributes inside the expression, which does not parse and
+        // takes the whole file's method bodies with it. Leaving the site degraded is strictly better.
+        if (target.Name.Contains('<') || target.Name.Contains('>'))
+            return false;
+
+        if (target.IsStatic)
+            return true;
+
+        // An instance target must actually be reachable from this method's receiver; a lambda lifted into a
+        // display class cannot call an instance method of the enclosing type.
+        return context.Locals.FirstOrDefault(l => l.IsThis)?.Type is { } thisType
+               && target.DeclaringType is { } declaringType
+               && thisType.IsAssignableTo(declaringType);
+    }
+
+    /// <summary>
+    /// The <c>(object, native int)</c> constructor a delegate's <c>newobj</c> must call, as a descriptor.
+    /// An instantiated generic type carries its own constructor list only on the definition, so the
+    /// definition's constructor is projected onto the instance - the same machinery generic calls use
+    /// (see FINDING-010), because emitting the definition's own constructor would reference an open <c>T</c>.
+    /// </summary>
+    private static IMethodDescriptor? FindDelegateCtor(TypeAnalysisContext delegateType)
+    {
+        if (delegateType is GenericInstanceTypeAnalysisContext instance)
+            return instance.GenericType.Methods
+                .FirstOrDefault(m => m is { Name: ".ctor", Parameters.Count: 2 })?
+                .ToMethodDescriptorOnInstance(instance);
+
+        return delegateType.Methods
+            .FirstOrDefault(m => m is { Name: ".ctor", Parameters.Count: 2 })?
+            .ToMethodDescriptor();
+    }
+
+    /// <summary>
+    /// Whether <paramref name="type"/> is a delegate type. The <c>IsDelegate</c> property only recognises the
+    /// instantiated form, and IL2CPP's allocations frequently name the generic *definition*
+    /// (<c>Comparison`1</c> rather than <c>Comparison&lt;AISkillFVO&gt;</c>), so the base chain is walked too.
+    /// </summary>
+    private static bool IsDelegateType(TypeAnalysisContext type)
+    {
+        if (type.IsDelegate)
+            return true;
+
+        var current = type.BaseType;
+
+        for (var depth = 0; current != null && depth < 32; depth++)
+        {
+            if (current.Namespace == "System" && current.Name is "MulticastDelegate" or "Delegate")
+                return true;
+
+            current = current.BaseType;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The MethodInfo a delegate allocation targets, or null when this is not a delegate creation.
+    /// IL2CPP emits the delegate type's allocation and the target method's MethodInfo as two separate
+    /// instructions, so the method has to be picked up from the neighbouring <c>Move</c>.
+    /// </summary>
+    private static Instruction? FindDelegateTarget(MethodAnalysisContext context, Instruction newobj)
+    {
+        var instructions = context.ControlFlowGraph!.Instructions;
+        var index = instructions.IndexOf(newobj);
+
+        if (index < 0)
+            return null;
+
+        for (var i = index + 1; i < instructions.Count; i++)
+        {
+            var candidate = instructions[i];
+
+            if (candidate is { OpCode: OpCode.Move, Operands: [_, RuntimeMethodInfoAnalysisContext] })
+                return candidate;
+
+            // Stop at the first instruction that consumes the new object - the target, if any, comes first.
+            if (candidate.Operands.Any(o => ReferenceEquals(o, newobj.Operands[0])))
+                return null;
+        }
+
+        return null;
+    }
 
     // Try find the follow up CallVoid for a constructor, after a Newobj.
     private static Instruction? FindConstructorCall(MethodAnalysisContext context, Instruction newobj)
