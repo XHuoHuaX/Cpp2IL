@@ -440,8 +440,12 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         Simplifier.Simplify(this);
         // A runtime class pointer in a type position (newobj/newarr/box/throw, or a GetTypeFromHandle
         // argument) denotes exactly one managed type; collapsing it is what lets the emitter produce real
-        // C# instead of `(IntPtr)typeof(T)`. See docs/FINDING-014/015.
+        // C# instead of `(IntPtr)typeof(T)`. See docs/FINDING-014.
         ClassPointerOperandFolder.Run(this);
+
+        // A noreturn raise helper's cold block reads as `return <exception instance>`, which can only be
+        // rendered as a fake value; throwing is the faithful reconstruction (red line C5).
+        ColdPathThrowRecovery.Run(this);
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
