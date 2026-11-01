@@ -447,6 +447,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // rendered as a fake value; throwing is the faithful reconstruction (red line C5).
         ColdPathThrowRecovery.Run(this);
 
+        // The class operand of a Newobj is a real type by now; give its destination that type. Running
+        // this early (ResolveTypesAndFields) misses it, because the operand is still an address there.
+        LocalVariables.SeedNewobjResults(this);
+
         // Fix float literals
         FloatLiteralRecovery.Run(this);
 

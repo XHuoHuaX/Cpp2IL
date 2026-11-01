@@ -428,7 +428,7 @@ public static class IlGenerator
                     for (var i = 0; i < constructorArgs.Count; i++)
                         LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType);
 
-                    instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
+                    instructions.Add(CilOpCodes.Newobj, CtorDescriptor(constructor, AllocatedType(instruction)));
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
 
                     constructorCall.OpCode = OpCode.Nop;
@@ -437,7 +437,7 @@ public static class IlGenerator
                 else if (instruction.Operands is [_, TypeAnalysisContext allocatedType] && allocatedType.Methods.FirstOrDefault(m => m is { Name: ".ctor", Parameters.Count: 0 }) is { } parameterlessCtor)
                 {
                     // Nothing to fuse with, so the allocation was self-contained. The type is still right, so construct it bare.
-                    instructions.Add(CilOpCodes.Newobj, parameterlessCtor.ToMethodDescriptor());
+                    instructions.Add(CilOpCodes.Newobj, CtorDescriptor(parameterlessCtor, allocatedType));
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 }
                 else
@@ -718,6 +718,21 @@ public static class IlGenerator
                && target.DeclaringType is { } declaringType
                && thisType.IsAssignableTo(declaringType);
     }
+
+    /// <summary>The type a <c>Newobj</c> allocates, when the operand names one.</summary>
+    private static TypeAnalysisContext? AllocatedType(Instruction newobj) =>
+        newobj.Operands.Count > 1 ? newobj.Operands[1] as TypeAnalysisContext : null;
+
+    /// <summary>
+    /// The descriptor a constructor call must use for the given allocation. An instantiated generic type
+    /// carries its constructors only on the definition, so the definition's constructor is projected onto
+    /// the instance - the same machinery generic calls use (FINDING-010). Emitting the definition's own
+    /// constructor renders as <c>new List&lt;T&gt;()</c> with an unbound <c>T</c>, which does not compile.
+    /// </summary>
+    private static IMethodDescriptor CtorDescriptor(MethodAnalysisContext constructor, TypeAnalysisContext? allocated) =>
+        allocated is GenericInstanceTypeAnalysisContext instance
+            ? constructor.ToMethodDescriptorOnInstance(instance)
+            : constructor.ToMethodDescriptor();
 
     /// <summary>
     /// The <c>(object, native int)</c> constructor a delegate's <c>newobj</c> must call, as a descriptor.

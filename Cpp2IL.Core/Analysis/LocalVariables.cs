@@ -291,7 +291,14 @@ public static class LocalVariables
         }
     }
 
-    private static void SeedNewobjResults(MethodAnalysisContext method)
+    /// <summary>
+    /// Gives each <c>Newobj</c> destination the type being allocated. Called once up front from
+    /// <see cref="ResolveTypesAndFields"/>, and again later once the class operand has actually been
+    /// resolved to a <see cref="TypeAnalysisContext"/> - at the early point it is frequently still a raw
+    /// address, so the local keeps whatever coarse type it was handed (typically the generic *definition*),
+    /// which then decompiles as the unbound name in <c>List&lt;&gt; x = ...</c> (CS7003).
+    /// </summary>
+    public static void SeedNewobjResults(MethodAnalysisContext method)
     {
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
