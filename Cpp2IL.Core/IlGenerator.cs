@@ -492,6 +492,18 @@ public static class IlGenerator
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
 
+                // A parameterless constructor call on this very object, from inside its own constructor, is
+                // the base/self initialiser. C# expresses that in the constructor initialiser (`: base()`)
+                // and the compiler emits it implicitly when absent, so the *statement* form
+                // `base._002Ector()` is not valid C# at all (CS1061) and must not be emitted.
+                // Nothing is lost by leaving it out: the same call still happens implicitly, and the guard
+                // (zero parameters, own `this`, enclosing method is a constructor) is what makes that exact.
+                if (targetMethod is { Name: ".ctor", Parameters.Count: 0 }
+                    && context.Name == ".ctor"
+                    && instruction.Operands.Count > thisParamIndex
+                    && instruction.Operands[thisParamIndex] is LocalVariable { IsThis: true })
+                    break;
+
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
                 // A call on a generic type instance has to reference that instance - see FINDING-010.
