@@ -262,9 +262,6 @@ public static class LocalVariables
                 throw new DecompilerException($"Type and field resolution not settling! (looped {MaxTypePropagationLoopCount} times)");
 
             changed = false;
-            // Runs before field resolution: it turns `v = base + off; [v]` into `[base + off]`, which
-            // is the only spelling ResolveFieldOffsets understands.
-            changed |= FoldAddressArithmetic(method);
             changed |= MetadataResolver.ResolveCallsViaMethodInfo(method);
             changed |= MetadataResolver.ResolveAmbiguousCalls(method);
             changed |= MetadataResolver.ResolveVirtualCalls(method);
@@ -275,123 +272,6 @@ public static class LocalVariables
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
         }
-    }
-
-    /// <summary>
-    /// IL2CPP routinely computes the address of a field into a scratch local (<c>v = base + 0x18</c>)
-    /// and then reads or writes through it. The field-offset resolver only understands
-    /// <c>[base + offset]</c>, so such an access stays unresolved and decompiles as pointer
-    /// arithmetic — <c>(Rect)(this + 24)</c>, <c>object*</c>, <c>Vector3*</c> — none of which any C#
-    /// can express. Fold the arithmetic into the memory operand: the same address, spelled directly.
-    ///
-    /// The gate is <b>structural</b>, deliberately not type-based (assuming types are already right is
-    /// what sank the fix46 attempt): the scratch local must have exactly one write, that write must be
-    /// "base plus or minus a constant", and every use must be a plain <c>[scratch]</c> access with no
-    /// index. Then the two spellings denote the same address by construction.
-    /// </summary>
-    private static bool FoldAddressArithmetic(MethodAnalysisContext method)
-    {
-        var instructions = method.ControlFlowGraph!.Instructions;
-
-        var writes = new Dictionary<LocalVariable, int>();
-        foreach (var instruction in instructions)
-            if (instruction.Operands.Count > 0 && instruction.Operands[0] is LocalVariable written)
-                writes[written] = writes.TryGetValue(written, out var seen) ? seen + 1 : 1;
-
-        var changed = false;
-
-        foreach (var definition in instructions.ToList())
-        {
-            if (definition.OpCode is not (OpCode.Add or OpCode.Subtract) || definition.Operands.Count < 3)
-                continue;
-
-            if (definition.Operands[0] is not LocalVariable scratch)
-                continue;
-
-            // One write only: a local that is rewritten is not "this one address".
-            if (!writes.TryGetValue(scratch, out var writeCount) || writeCount != 1)
-                continue;
-
-            IOperand? baseOperand = null;
-            long offset = 0;
-            var reAddressable = true;
-
-            for (var i = 1; i < definition.Operands.Count && reAddressable; i++)
-            {
-                var operand = definition.Operands[i];
-
-                if (operand is Immediate immediate)
-                {
-                    // Only `base - constant` makes sense; a leading constant is not an address.
-                    if (definition.OpCode == OpCode.Subtract && i != definition.Operands.Count - 1)
-                    {
-                        reAddressable = false;
-                        break;
-                    }
-
-                    offset += definition.OpCode == OpCode.Add ? immediate.Value : -immediate.Value;
-                    continue;
-                }
-
-                if (baseOperand != null) // two non-constant operands: not a simple address
-                    reAddressable = false;
-                else
-                    baseOperand = operand;
-            }
-
-            if (!reAddressable || baseOperand == null || offset == 0 || ReferenceEquals(baseOperand, scratch))
-                continue;
-
-            // Every use must be a plain [scratch] access - a value use or an indexed use means the
-            // local is something more than this address.
-            var usable = true;
-            foreach (var user in instructions)
-            {
-                if (ReferenceEquals(user, definition))
-                    continue;
-
-                for (var i = 0; i < user.Operands.Count && usable; i++)
-                {
-                    var operand = user.Operands[i];
-
-                    if (operand is MemoryOperand memory)
-                    {
-                        if (ReferenceEquals(memory.Base, scratch))
-                            usable = memory.Index == null && memory.Scale == 0;
-                        else if (ReferenceEquals(memory.Index, scratch))
-                            usable = false;
-
-                        continue;
-                    }
-
-                    if (ReferenceEquals(operand, scratch))
-                        usable = false;
-                }
-
-                if (!usable)
-                    break;
-            }
-
-            if (!usable)
-                continue;
-
-            foreach (var user in instructions)
-            {
-                for (var i = 0; i < user.Operands.Count; i++)
-                {
-                    if (user.Operands[i] is not MemoryOperand memory || !ReferenceEquals(memory.Base, scratch))
-                        continue;
-
-                    user.SetOperand(i, new MemoryOperand(baseOperand, null, memory.Addend + offset, 0));
-                }
-            }
-
-            definition.OpCode = OpCode.Nop;
-            definition.SetOperands();
-            changed = true;
-        }
-
-        return changed;
     }
 
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
