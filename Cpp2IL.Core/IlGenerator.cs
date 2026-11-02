@@ -236,15 +236,18 @@ public static class IlGenerator
 
                 var target = (Instruction)instruction.Operands[0];
 
-                if (!instructionMap.ContainsKey(target))
+                // An ISIL instruction can legitimately expand to no CIL at all, in which case it has no
+                // instruction to point a label at. Treat it exactly like a target that is missing from
+                // the map instead of indexing into an empty list.
+                if (!instructionMap.TryGetValue(target, out var targetIl) || targetIl.Count == 0)
                 {
-                    context.AddWarning($"Branch target not in ISIL to IL map: {instruction} --- {target}");
+                    context.AddWarning($"Branch target has no emitted IL: {instruction} --- {target} ({target.OpCode})");
                     ilBranch.OpCode = CilOpCodes.Nop;
                     ilBranch.Operand = null;
                     continue;
                 }
 
-                ilBranch.Operand = new CilInstructionLabel(instructionMap[target][0]);
+                ilBranch.Operand = new CilInstructionLabel(targetIl[0]);
             }
         }
         
@@ -502,7 +505,13 @@ public static class IlGenerator
                     && context.Name == ".ctor"
                     && instruction.Operands.Count > thisParamIndex
                     && instruction.Operands[thisParamIndex] is LocalVariable { IsThis: true })
+                {
+                    // Nothing is emitted for this instruction, but it still needs an anchor: any branch
+                    // that targets it has to resolve to a real CIL instruction, and a block that starts
+                    // here needs an entry point. A Nop costs nothing at runtime and is dropped later.
+                    instructions.Add(CilOpCodes.Nop);
                     break;
+                }
 
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
