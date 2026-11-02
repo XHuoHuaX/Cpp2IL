@@ -623,7 +623,7 @@ public static class IlGenerator
             case OpCode.Xor:
                 // klass pointer read => GetType
                 if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
-                    && TryEmitExactTypeComparison(instruction, method, locals, writeLine))
+                    && TryEmitExactTypeComparison(context, instruction, method, locals, writeLine))
                     break;
 
                 // Float arithmetic on a promoted integer operand needs an explicit conversion, so both
@@ -881,6 +881,18 @@ public static class IlGenerator
             return;
         }
 
+        // A zeroed struct reaches us as an integer zero as well. A number is not convertible to a
+        // struct in C#, so materialise the default value of that struct instead of the literal.
+        if (expectedType is { } zeroed && IsCompositeValueType(zeroed) && IsZeroConstant(operand))
+        {
+            var zero = new CilLocalVariable(zeroed.ToTypeSignature());
+            method.CilMethodBody.LocalVariables.Add(zero);
+            instructions.Add(CilOpCodes.Ldloca, zero);
+            instructions.Add(CilOpCodes.Initobj, zeroed.ToTypeSignature().ToTypeDefOrRef());
+            instructions.Add(CilOpCodes.Ldloc, zero);
+            return;
+        }
+
         switch (operand)
         {
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
@@ -907,7 +919,14 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I4);
                 break;
             case AddressOf { Target: LocalVariable addressed }:
-                instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+                // The address of a local is only meaningful where a managed pointer is wanted. Where
+                // the consumer wants the value (an ordinary assignment or argument), taking the
+                // address produces a pointer where a T is expected - `object x = (object)(&y)`, which
+                // is not expressible in C#. The value is what that consumer needs, so load it.
+                if (expectedType is { } wanted && wanted is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
+                    instructions.Add(CilOpCodes.Ldloc, locals[addressed]);
+                else
+                    instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);
@@ -997,7 +1016,7 @@ public static class IlGenerator
         }
     }
     
-    private static bool TryEmitExactTypeComparison(Instruction instruction, MethodDefinition method,
+    private static bool TryEmitExactTypeComparison(MethodAnalysisContext context, Instruction instruction, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
         var left = instruction.Operands[1];
@@ -1005,11 +1024,16 @@ public static class IlGenerator
 
         IOperand typeOperand;
         LocalVariable objLocal;
+        LocalVariable? consumedTypeHandle = null;
 
-        if (left is TypeAnalysisContext && IsKlassPointerLoad(right, out var rightLocal))
-            (typeOperand, objLocal) = (left, rightLocal);
-        else if (right is TypeAnalysisContext && IsKlassPointerLoad(left, out var leftLocal))
-            (typeOperand, objLocal) = (right, leftLocal);
+        // One side is the object, the other is the type it is being compared against. Both halves
+        // come in several shapes on the way from the native code: the object itself or its klass
+        // pointer read (`[obj]`, offset 0), and the type as an operand, a handle local, or a read of
+        // one. Any combination means the same thing.
+        if (IsObjectSide(left, out var leftObject) && TryGetTypeSide(right, out var rightType, out var rightHandle))
+            (typeOperand, objLocal, consumedTypeHandle) = (rightType, leftObject, rightHandle);
+        else if (IsObjectSide(right, out var rightObject) && TryGetTypeSide(left, out var leftType, out var leftHandle))
+            (typeOperand, objLocal, consumedTypeHandle) = (leftType, rightObject, leftHandle);
         else
             return false;
 
@@ -1033,7 +1057,92 @@ public static class IlGenerator
         }
 
         StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+
+        // The handle's own definition is now part of the comparison. Emitting it as well leaves a
+        // pointer local assigned from a System.Type, which is not a conversion C# has.
+        if (consumedTypeHandle != null)
+            NopDefiningMove(context, consumedTypeHandle, instruction);
+
         return true;
+    }
+
+    // The object half of a type comparison: the object itself, or its klass pointer read at offset 0.
+    // A local that carries a handle is not an object, so it is excluded here and picked up as the
+    // type half instead.
+    private static bool IsObjectSide(IOperand operand, out LocalVariable local)
+    {
+        local = operand switch
+        {
+            MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable baseLocal } => baseLocal,
+            LocalVariable direct => direct,
+            _ => null!,
+        };
+
+        if (local == null || local.Type is not { IsValueType: false } || IsHandleType(local.Type))
+        {
+            local = null!;
+            return false;
+        }
+
+        return true;
+    }
+
+    // The type half of a type comparison: a type operand, or a local holding the klass pointer for
+    // exactly one type (which is how the handle survives when it is materialised before the branch).
+    private static bool TryGetTypeSide(IOperand operand, out TypeAnalysisContext type, out LocalVariable? handleLocal)
+    {
+        (type, handleLocal) = operand switch
+        {
+            TypeAnalysisContext direct => (direct, (LocalVariable?)null),
+            LocalVariable handle => (HandleTypeOf(handle.Type), handle),
+            MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable handle } => (HandleTypeOf(handle.Type), handle),
+            _ => (null, null),
+        };
+
+        return type != null;
+    }
+
+    private static TypeAnalysisContext? HandleTypeOf(TypeAnalysisContext? type) =>
+        type is RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } ? represented : null;
+
+    private static bool Mentions(IOperand operand, LocalVariable local) => operand switch
+    {
+        LocalVariable candidate => ReferenceEquals(candidate, local),
+        MemoryOperand memory => Mentions(memory.Base, local) || (memory.Index != null && Mentions(memory.Index, local)),
+        AddressOf addressOf => Mentions(addressOf.Target, local),
+        _ => false,
+    };
+
+    // A handle stands for a type; it is never an instance of one.
+    private static bool IsHandleType(TypeAnalysisContext type) =>
+        type is RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
+            or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+            or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext;
+
+    // Only safe while the local has exactly two mentions: this definition and the use that consumed it.
+    private static void NopDefiningMove(MethodAnalysisContext context, LocalVariable handle, Instruction consumer)
+    {
+        Instruction? definition = null;
+        var mentions = 0;
+
+        foreach (var candidate in context.ControlFlowGraph!.Instructions)
+        {
+            // The consumer usually reads the handle through a memory operand (`[handle]`), so a plain
+            // reference check on the operands would miss it and leave the definition in place.
+            if (!candidate.Operands.Any(operand => Mentions(operand, handle)))
+                continue;
+
+            mentions++;
+
+            if (candidate.OpCode == OpCode.Move && ReferenceEquals(candidate.Operands[0], handle))
+                definition = candidate;
+        }
+
+        if (mentions != 2 || definition == null || ReferenceEquals(definition, consumer))
+            return;
+
+        definition.OpCode = OpCode.Nop;
+        definition.SetOperands();
     }
     
     private static bool IsKlassPointerLoad(IOperand operand, out LocalVariable local)
@@ -1071,6 +1180,15 @@ public static class IlGenerator
         operand is LocalVariable { Type: { } type } && type == context.AppContext.SystemTypes.SystemBooleanType;
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
+
+    // A value type that a machine word cannot stand in for: a struct (or a nullable), as opposed to a
+    // primitive or an enum, both of which are just integers at the CLR level.
+    private static bool IsCompositeValueType(TypeAnalysisContext type) =>
+        type is { IsValueType: true, IsEnumType: false }
+        && type.FullName is not ("System.Boolean" or "System.Char" or "System.SByte" or "System.Byte"
+            or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32"
+            or "System.Int64" or "System.UInt64" or "System.Single" or "System.Double"
+            or "System.IntPtr" or "System.UIntPtr" or "System.Void");
     
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>
         destination switch

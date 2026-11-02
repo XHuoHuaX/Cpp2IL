@@ -590,7 +590,7 @@ public static class LocalVariables
                     break;
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
-                    changed |= PropagateIntegerResult(instruction, method);
+                    changed |= PropagateBooleanResult(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
             }
         }
@@ -639,6 +639,32 @@ public static class LocalVariables
 
         return false;
     }
+
+    // The logical operators are also defined on bool - `&`, `|`, `^` and `!` on booleans yield a
+    // boolean - so a bitwise op with boolean operands is flag logic, and its result is bool. Nothing
+    // else types these: the integer rule above deliberately leaves boolean operands alone. Left
+    // untyped, the result degrades to object and every later use becomes `object & int`, `~object`.
+    private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
+    {
+        if (instruction.Operands[0] is not LocalVariable { Type: null } destination)
+            return false;
+
+        if (instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight)
+            return false; // no boolean shift: a bool operand here would be a mistyped integer
+
+        for (var i = 1; i < instruction.Operands.Count; i++)
+            if (BooleanOperandType(instruction.Operands[i]) != null)
+                return SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
+
+        return false;
+    }
+
+    private static TypeAnalysisContext? BooleanOperandType(IOperand operand) => operand switch
+    {
+        LocalVariable { Type: { FullName: "System.Boolean" } boolean } => boolean,
+        FieldReference { Field.FieldType: { FullName: "System.Boolean" } boolean } => boolean,
+        _ => null,
+    };
 
     private static TypeAnalysisContext? IntegerResultType(IOperand operand, MethodAnalysisContext method)
     {
