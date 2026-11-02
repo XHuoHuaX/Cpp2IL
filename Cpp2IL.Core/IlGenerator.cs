@@ -178,6 +178,28 @@ public static class IlGenerator
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
 
+        // Every allocation/constructor pairing is decided up front, and the constructor call is turned
+        // into a Nop here rather than when the allocation is emitted. IL2CPP puts the allocation and the
+        // call in different blocks, and the blocks are emitted in CFG order - so if the call's block
+        // comes first, a lazy match would emit the constructor as an instance call (`x._002Ector(...)`,
+        // which is not valid C#) and then the allocation's own `newobj`, constructing the object twice.
+        var fusedConstructors = new Dictionary<Instruction, FusedConstructor>();
+        foreach (var candidate in context.ControlFlowGraph!.Instructions)
+        {
+            if (candidate.OpCode != OpCode.Newobj)
+                continue;
+
+            if (FindConstructorCall(context, candidate) is not { Operands: [MethodAnalysisContext constructor, ..] } call)
+                continue;
+
+            var receiverIndex = ConstructorReceiverIndex(call);
+            var arguments = call.Operands.Skip(receiverIndex + 1).ToArray();
+            fusedConstructors[candidate] = new FusedConstructor(constructor, arguments);
+
+            call.OpCode = OpCode.Nop;
+            call.SetOperands();
+        }
+
         foreach (var block in context.ControlFlowGraph!.Blocks)
         {
             if (block == context.ControlFlowGraph.EntryBlock || block == context.ControlFlowGraph.ExitBlock)
@@ -188,7 +210,7 @@ public static class IlGenerator
 
             foreach (var instruction in block.Instructions)
             {
-                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine);
+                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, fusedConstructors);
                 instructionMap.Add(instruction, generated);
 
                 if (!blockEntryMap.ContainsKey(block) && generated.Count > 0)
@@ -312,7 +334,8 @@ public static class IlGenerator
     }
 
     private static List<CilInstruction> GenerateInstructions(Instruction instruction, MethodAnalysisContext context,
-        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
+        IReadOnlyDictionary<Instruction, FusedConstructor> fusedConstructors)
     {
         var body = method.CilMethodBody!;
         var instructions = body.Instructions;
@@ -414,28 +437,25 @@ public static class IlGenerator
 
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
 
-                    // The ctor call that IL2CPP emitted alongside the allocation is now part of the
-                    // `newobj` above, so it must not be emitted again (it would become an `_002Ector` call
-                    // on the finished delegate, taking the dropped MethodInfo pointer).
-                    if (FindConstructorCall(context, instruction) is { } consumedCtor)
+                    // The ctor call that IL2CPP emitted alongside the allocation is already a Nop: the
+                    // pairing was resolved in the pre-pass, along with every other allocation. If the
+                    // pre-pass found no pairing (the call may name the finished delegate rather than the
+                    // allocated local), consume it here so it is not emitted as a second construction.
+                    if (!fusedConstructors.ContainsKey(instruction) && FindConstructorCall(context, instruction) is { } consumedCtor)
                     {
                         consumedCtor.OpCode = OpCode.Nop;
                         consumedCtor.SetOperands();
                     }
                 }
-                else if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
+                else if (fusedConstructors.TryGetValue(instruction, out var fused))
                 {
-                    // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
-                    // the constructor declares (i.e. drop methodInfo)
-                    var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
+                    var constructor = fused.Constructor;
+                    var constructorArgs = fused.Arguments.Take(constructor.Parameters.Count).ToList();
                     for (var i = 0; i < constructorArgs.Count; i++)
                         LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType);
 
                     instructions.Add(CilOpCodes.Newobj, CtorDescriptor(constructor, AllocatedType(instruction)));
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
-
-                    constructorCall.OpCode = OpCode.Nop;
-                    constructorCall.SetOperands();
                 }
                 else if (instruction.Operands is [_, TypeAnalysisContext allocatedType] && allocatedType.Methods.FirstOrDefault(m => m is { Name: ".ctor", Parameters.Count: 0 }) is { } parameterlessCtor)
                 {
@@ -706,6 +726,13 @@ public static class IlGenerator
     }
     
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
+
+    /// <summary>
+    /// One allocation's constructor call, resolved before any IL was emitted. <see cref="Arguments"/>
+    /// is captured because the call itself becomes a Nop (and loses its operands) as soon as it is
+    /// paired, while the allocation still needs those arguments to emit a real <c>newobj</c>.
+    /// </summary>
+    private sealed record FusedConstructor(MethodAnalysisContext Constructor, IOperand[] Arguments);
 
     /// <summary>
     /// Whether the delegate's target method can be named in emitted IL at all. Two shapes cannot, and
