@@ -44,26 +44,81 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     /// Widening the fields of the assemblies we emit restores the access the native code had without
     /// changing any behaviour: visibility is not semantics.
     ///
-    /// Fields only, deliberately. Widening a *method* can break the rule that an override keeps its
-    /// base's accessibility (CS0507), which would trade one error class for another; fields have no
-    /// such rule.
+    /// The *types* have to be widened with them, or a now-public field whose type is an internal or
+    /// nested-private class becomes an inconsistent-accessibility error (CS0052) - the same trade in a
+    /// different spelling.
+    ///
+    /// Members that are not fields are left alone, deliberately. Widening a *method* can break the rule
+    /// that an override keeps its base's accessibility (CS0507); fields and types have no such rule.
     /// </summary>
     protected override void OnAssembliesBuilt(List<AssemblyDefinition> assemblies)
     {
-        var widened = 0;
+        var widenedFields = 0;
+        var widenedTypes = 0;
+        var renamedFields = 0;
 
         foreach (var module in assemblies.Select(a => a.ManifestModule).OfType<ModuleDefinition>())
+        {
             foreach (var type in module.GetAllTypes())
+            {
+                // IL2CPP metadata keeps the compiler-generated backing field of an event, and that field
+                // carries the event's own name; emitting both declarations is CS0102. The C# decompiler
+                // normally sidesteps this by renaming the field, but only while the field is private -
+                // once widened it keeps its name and the collision survives. Rename it here instead, so
+                // the field can stay accessible: the definition is renamed, so every reference to it
+                // follows, and nothing about the value or layout changes.
+                var takenByOtherKinds = new HashSet<string>();
+                foreach (var method in type.Methods)
+                    if (method.Name is { } methodName)
+                        takenByOtherKinds.Add(methodName.ToString());
+                foreach (var property in type.Properties)
+                    if (property.Name is { } propertyName)
+                        takenByOtherKinds.Add(propertyName.ToString());
+                foreach (var ev in type.Events)
+                    if (ev.Name is { } eventName)
+                        takenByOtherKinds.Add(eventName.ToString());
+                foreach (var nested in type.NestedTypes)
+                    if (nested.Name is { } nestedName)
+                        takenByOtherKinds.Add(nestedName.ToString());
+
+                var fieldNames = new HashSet<string>(type.Fields.Select(f => f.Name.ToString()));
+
+                foreach (var field in type.Fields)
+                {
+                    if (field.Name is not { } fieldName || !takenByOtherKinds.Contains(fieldName.ToString()))
+                        continue;
+
+                    var name = fieldName.ToString();
+                    var candidate = "m_" + name;
+                    for (var suffix = 2; takenByOtherKinds.Contains(candidate) || fieldNames.Contains(candidate); suffix++)
+                        candidate = "m_" + name + "_" + suffix;
+
+                    fieldNames.Remove(name);
+                    field.Name = candidate;
+                    fieldNames.Add(candidate);
+                    renamedFields++;
+                }
+
+                // Nested types need NestedPublic; see ECMA-335 II.10.1.3 for the separate nested flag set.
+                var wanted = type.IsNested ? TypeAttributes.NestedPublic : TypeAttributes.Public;
+                if ((type.Attributes & TypeAttributes.VisibilityMask) != wanted)
+                {
+                    type.Attributes = (type.Attributes & ~TypeAttributes.VisibilityMask) | wanted;
+                    widenedTypes++;
+                }
+
                 foreach (var field in type.Fields)
                 {
                     if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
                         continue;
 
                     field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | FieldAttributes.Public;
-                    widened++;
+                    widenedFields++;
                 }
+            }
+        }
 
-        Logger.InfoNewline($"[IlRecoverySafe] accessibility: {widened} field(s) widened to public", "IlRecoverySafe");
+        Logger.InfoNewline($"[IlRecoverySafe] accessibility: {widenedFields} field(s) and {widenedTypes} type(s) widened to public; {renamedFields} field(s) renamed to avoid a member-name collision", "IlRecoverySafe");
     }
 
     // [0]=clean [1]=placeholder [2]=analysis exception [3]=skipped engine assembly
