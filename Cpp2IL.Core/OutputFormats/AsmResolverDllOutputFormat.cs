@@ -45,6 +45,8 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     {
         var ret = BuildAssemblies(context);
 
+        OnAssembliesBuilt(ret);
+
         var start = DateTime.Now;
         Logger.Verbose("Generating PE images...", "DllOutput");
 
@@ -77,6 +79,14 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
             var percent = Math.Round((SuccessfulMethodCount / (float)TotalMethodCount) * 100);
             Logger.InfoNewline($"{percent}% of methods successfully decompiled ({SuccessfulMethodCount} / {TotalMethodCount})", "DllOutput");
         }
+    }
+
+    /// <summary>
+    /// Called once the assemblies are fully built and before they are written to disk, so a subclass can
+    /// apply output-wide policy (e.g. widening accessibility) that no per-type hook can express.
+    /// </summary>
+    protected virtual void OnAssembliesBuilt(List<AssemblyDefinition> assemblies)
+    {
     }
 
     public virtual List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)

@@ -9,6 +9,7 @@ using System.Threading;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
+using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
@@ -35,6 +36,35 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
     public override string OutputFormatId => "dll_il_recovery_safe";
     public override string OutputFormatName => "DLL files with safe IL Recovery (methods with placeholders are stubbed)";
+
+    /// <summary>
+    /// Accessibility is a compile-time notion; the native code these bodies were translated from has
+    /// none. A method legitimately reads a private field of its own base type, or of a sibling type it
+    /// reaches through a pointer, and C# then refuses to compile the - correct - translation (CS0122).
+    /// Widening the fields of the assemblies we emit restores the access the native code had without
+    /// changing any behaviour: visibility is not semantics.
+    ///
+    /// Fields only, deliberately. Widening a *method* can break the rule that an override keeps its
+    /// base's accessibility (CS0507), which would trade one error class for another; fields have no
+    /// such rule.
+    /// </summary>
+    protected override void OnAssembliesBuilt(List<AssemblyDefinition> assemblies)
+    {
+        var widened = 0;
+
+        foreach (var module in assemblies.Select(a => a.ManifestModule).OfType<ModuleDefinition>())
+            foreach (var type in module.GetAllTypes())
+                foreach (var field in type.Fields)
+                {
+                    if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
+                        continue;
+
+                    field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | FieldAttributes.Public;
+                    widened++;
+                }
+
+        Logger.InfoNewline($"[IlRecoverySafe] accessibility: {widened} field(s) widened to public", "IlRecoverySafe");
+    }
 
     // [0]=clean [1]=placeholder [2]=analysis exception [3]=skipped engine assembly
     private readonly ConcurrentDictionary<string, int[]> _perAssembly = new();
