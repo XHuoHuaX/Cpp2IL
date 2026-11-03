@@ -728,6 +728,49 @@ public static class IlGenerator
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
 
     /// <summary>
+    /// Maps a BCL internal field that IL2CPP left behind (because the callee was inlined into its
+    /// caller) onto the public property it backs, and emits the property read instead of the field read.
+    ///
+    /// Only fields that denote *exactly* the public value are listed, because a wrong value here would
+    /// be silent - the red line this project does not cross. Deliberately absent:
+    /// <c>Dictionary&lt;K,V&gt;._count</c> (Count is <c>_count - _freeCount</c>, not <c>_count</c>),
+    /// <c>_items</c>/<c>_buckets</c> (no public equivalent), and the delegate internals
+    /// <c>m_target</c>/<c>method_ptr</c> (they are written here, not read).
+    /// </summary>
+    private static bool TryEmitEquivalentProperty(FieldReference field, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilInstructionCollection instructions)
+    {
+        var declaring = field.Field.DeclaringType;
+        var definition = (declaring as GenericInstanceTypeAnalysisContext)?.GenericType ?? declaring;
+
+        var isIndexedContainer = definition.Namespace == "System.Collections.Generic"
+            && definition.Name is "List`1" or "Queue`1" or "Stack`1";
+        var isString = definition.Namespace == "System" && definition.Name == "String";
+
+        string? propertyName = null;
+        if (field.Field.Name == "_size" && isIndexedContainer)
+            propertyName = "Count";
+        else if (field.Field.Name is "m_stringLength" or "_stringLength" && isString)
+            propertyName = "Length";
+
+        if (propertyName == null)
+            return false;
+
+        // The getter is taken from the definition (an instance type exposes no property list of its
+        // own) and re-parented onto the instance below, so the reference is a closed generic.
+        var getter = definition.Properties.FirstOrDefault(p => p.Name == propertyName)?.Getter;
+        if (getter == null)
+            return false;
+
+        var parent = declaring.ToTypeSignature().ToTypeDefOrRef();
+        var member = parent.CreateMemberReference(getter.Name, getter.ToMethodDescriptor().Signature);
+
+        LoadLocal(field.Local, method, locals);
+        instructions.Add(CilOpCodes.Callvirt, member);
+        return true;
+    }
+
+    /// <summary>
     /// One allocation's constructor call, resolved before any IL was emitted. <see cref="Arguments"/>
     /// is captured because the call itself becomes a Nop (and loses its operands) as soon as it is
     /// paired, while the allocation still needs those arguments to emit a real <c>newobj</c>.
@@ -969,6 +1012,14 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Ldsfld, field.Field.ToFieldDescriptor());
                     break;
                 }
+
+                // IL2CPP inlines small BCL methods into their callers, so a body can end up reading a
+                // BCL internal field directly (`List<T>._size`, `String.m_stringLength`). Those members
+                // are invisible to the emitted assembly and C# cannot name them at all, so the site
+                // would otherwise not compile. Where such a field *is* the backing store of a public
+                // property, read the property: same value, same semantics, nothing approximated.
+                if (TryEmitEquivalentProperty(field, method, locals, instructions))
+                    break;
 
                 LoadLocal(field.Local, method, locals);
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
