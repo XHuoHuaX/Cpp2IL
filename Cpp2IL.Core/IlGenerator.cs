@@ -643,7 +643,7 @@ public static class IlGenerator
             case OpCode.Xor:
                 // klass pointer read => GetType
                 if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
-                    && TryEmitExactTypeComparison(instruction, method, locals, writeLine))
+                    && TryEmitExactTypeComparison(context, instruction, method, locals, writeLine))
                     break;
 
                 // Float arithmetic on a promoted integer operand needs an explicit conversion, so both
@@ -1090,19 +1090,32 @@ public static class IlGenerator
         }
     }
     
-    private static bool TryEmitExactTypeComparison(Instruction instruction, MethodDefinition method,
+    /// <summary>
+    /// Recognises "is this object exactly of type T" and emits <c>obj.GetType() == typeof(T)</c>.
+    ///
+    /// Two shapes reach here. (a) the type is named directly by the comparison operand. (b) the runtime
+    /// type was materialised into a local first, so the comparison reads <c>[handle]</c>; that is only
+    /// accepted when the handle is defined once (by a <c>typeof</c> load) and used once, by this very
+    /// comparison - i.e. it exists solely to carry the type. Matching shape (b) on operand types alone
+    /// was measured worse (S33, CS0030 +537): plain object/object comparisons satisfy it too.
+    /// </summary>
+    private static bool TryEmitExactTypeComparison(MethodAnalysisContext context, Instruction instruction, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
         var left = instruction.Operands[1];
         var right = instruction.Operands[2];
 
-        // Recognising the handle through a local as well was tried in S33 (fix46) and measured worse:
-        // it fired on plain object/object comparisons and turned them into typeof() comparisons
-        // (CS0030 +537). Only the shapes that name a type directly are matched here.
         IOperand typeOperand;
         LocalVariable objLocal;
+        Instruction? consumedHandle = null;
 
-        if (left is TypeAnalysisContext && IsKlassPointerLoad(right, out var rightLocal))
+        if (TryResolveSingleUseTypeHandle(context, left, out var leftType, out var leftDefinition)
+            && TryResolveObjectSide(right, out var rightObject))
+            (typeOperand, objLocal, consumedHandle) = (leftType, rightObject, leftDefinition);
+        else if (TryResolveSingleUseTypeHandle(context, right, out var rightType, out var rightDefinition)
+                 && TryResolveObjectSide(left, out var leftObject))
+            (typeOperand, objLocal, consumedHandle) = (rightType, leftObject, rightDefinition);
+        else if (left is TypeAnalysisContext && IsKlassPointerLoad(right, out var rightLocal))
             (typeOperand, objLocal) = (left, rightLocal);
         else if (right is TypeAnalysisContext && IsKlassPointerLoad(left, out var leftLocal))
             (typeOperand, objLocal) = (right, leftLocal);
@@ -1129,8 +1142,94 @@ public static class IlGenerator
         }
 
         StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+
+        // The handle's definition is now part of the comparison above. Leaving it would emit
+        // `IntPtr p = (IntPtr)typeof(T)`, a conversion C# does not have.
+        if (consumedHandle != null)
+        {
+            consumedHandle.OpCode = OpCode.Nop;
+            consumedHandle.SetOperands();
+        }
+
         return true;
     }
+
+    // The object half of a type comparison: the object itself, or its klass pointer read at offset 0.
+    private static bool TryResolveObjectSide(IOperand operand, out LocalVariable local)
+    {
+        if (IsKlassPointerLoad(operand, out local))
+            return !IsTypeHandleLocal(local);
+
+        if (operand is LocalVariable { Type: { IsValueType: false } } direct && !IsTypeHandleLocal(direct))
+        {
+            local = direct;
+            return true;
+        }
+
+        local = null!;
+        return false;
+    }
+
+    // A local that stands for a type rather than for an instance of one.
+    private static bool IsTypeHandleLocal(LocalVariable local) => local.Type is RuntimeClassTypeAnalysisContext
+        or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+        or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext;
+
+    /// <summary>
+    /// Resolves <c>[handle]</c> (or the handle local itself) to the type it carries, but only when the
+    /// handle is written exactly once - by a <c>typeof</c> load - and mentioned exactly twice in total
+    /// (that load, and this comparison). That "single definition, single use" gate is what keeps this
+    /// from rewriting ordinary comparisons.
+    /// </summary>
+    private static bool TryResolveSingleUseTypeHandle(MethodAnalysisContext context, IOperand operand,
+        out TypeAnalysisContext type, out Instruction? definition)
+    {
+        type = null!;
+        definition = null;
+
+        var handle = operand switch
+        {
+            MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable baseLocal } => baseLocal,
+            LocalVariable local => local,
+            _ => null,
+        };
+
+        if (handle == null || !IsTypeHandleLocal(handle))
+            return false;
+
+        var writes = 0;
+        var mentions = 0;
+
+        foreach (var candidate in context.ControlFlowGraph!.Instructions)
+        {
+            if (candidate.Operands.Count > 0 && ReferenceEquals(candidate.Operands[0], handle))
+            {
+                writes++;
+                definition = candidate;
+            }
+
+            foreach (var candidateOperand in candidate.Operands)
+                if (MentionsLocal(candidateOperand, handle))
+                    mentions++;
+        }
+
+        if (writes != 1 || mentions != 2 || definition is not { OpCode: OpCode.Move } || definition.Operands.Count < 2)
+            return false;
+
+        if (definition.Operands[1] is not TypeAnalysisContext carried)
+            return false;
+
+        type = carried;
+        return true;
+    }
+
+    private static bool MentionsLocal(IOperand operand, LocalVariable local) => operand switch
+    {
+        LocalVariable candidate => ReferenceEquals(candidate, local),
+        MemoryOperand memory => MentionsLocal(memory.Base!, local) || (memory.Index != null && MentionsLocal(memory.Index, local)),
+        AddressOf addressOf => MentionsLocal(addressOf.Target, local),
+        _ => false,
+    };
     
     private static bool IsKlassPointerLoad(IOperand operand, out LocalVariable local)
     {
