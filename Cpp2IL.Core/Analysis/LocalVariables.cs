@@ -66,8 +66,37 @@ public static class LocalVariables
             }
         }
 
-        method.Locals = locals.Select(kv => kv.Value).ToList();
+        // The registers that hold a frame pointer rather than data, per target.
+        static bool IsFrameRegister(string? name) => name is "rsp" or "rbp" or "ebp" or "sp" or "x29" or "fp";
 
+        // IL2CPP addresses a stack slot as <frame register> + offset, e.g. `[v3 @ rsp+8]`. After the
+        // register->local mapping that is a MemoryOperand based on the local holding the *frame pointer*,
+        // which is not a memory load at all: it names a distinct slot of the current frame. Promote each
+        // (frame local, offset) pair to a local of its own, so downstream sees a variable rather than an
+        // unmanaged load. Without this the x64 backend drops ~71% of its bodies to
+        // "Unmanaged memory load" (610,510 of 858,023 issues on a Unity 2018.2 x64 build).
+        var slotLocals = new Dictionary<(Register, long), LocalVariable>();
+        foreach (var instruction in instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0 } memory
+                    || memory.Base is not LocalVariable frame
+                    || !IsFrameRegister(frame.Register.Name))
+                    continue;
+
+                var key = (frame.Register, memory.Addend);
+                if (!slotLocals.TryGetValue(key, out var slot))
+                {
+                    slot = new LocalVariable($"slot_{memory.Addend:X}", frame.Register);
+                    slotLocals[key] = slot;
+                }
+
+                instruction.SetOperand(i, slot);
+            }
+        }
+
+        method.Locals = locals.Select(kv => kv.Value).Concat(slotLocals.Values).ToList();
         // Return local names
         var retValIndex = 0;
         foreach (var instruction in instructions)
