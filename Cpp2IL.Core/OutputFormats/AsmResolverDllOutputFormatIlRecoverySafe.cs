@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Signatures;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
@@ -56,6 +57,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         var widenedFields = 0;
         var widenedTypes = 0;
         var renamedFields = 0;
+        var widenedMethods = 0;
 
         foreach (var module in assemblies.Select(a => a.ManifestModule).OfType<ModuleDefinition>())
         {
@@ -113,10 +115,112 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                     field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | FieldAttributes.Public;
                     widenedFields++;
                 }
+
+                // Methods are widened too. A public method may not expose a less-accessible parameter (CS0051) or
+                // return type (CS0050), so the types its signature mentions are widened with it - but only
+                // when they are declared in this same module. A type from another module cannot be widened
+                // here without publishing that assembly's stubs (measured, far worse), so in that case the
+                // method keeps its original accessibility instead of trading one error for another.
+                foreach (var method in type.Methods)
+                {
+                    if ((method.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public)
+                        continue;
+
+                    if (!MakeSignatureExpressible(method.Signature, module, ref widenedTypes))
+                        continue;
+
+                    method.Attributes = (method.Attributes & ~MethodAttributes.MemberAccessMask) | MethodAttributes.Public;
+                    widenedMethods++;
+                }
             }
         }
 
-        Logger.InfoNewline($"[IlRecoverySafe] accessibility: {widenedFields} field(s) and {widenedTypes} type(s) widened to public; {renamedFields} field(s) renamed to avoid a member-name collision", "IlRecoverySafe");
+        Logger.InfoNewline($"[IlRecoverySafe] accessibility: {widenedFields} field(s), {widenedMethods} method(s) and {widenedTypes} type(s) widened to public; {renamedFields} field(s) renamed to avoid a member-name collision", "IlRecoverySafe");
+    }
+
+    /// <summary>
+    /// Whether every type in this signature is namable at public visibility. Used to keep a widened member
+    /// from tripping the inconsistent-accessibility rules (CS0050/CS0051/CS0052/CS0053).
+    /// </summary>
+    /// <summary>
+    /// Makes every type named by this signature namable at public visibility, widening the ones this module
+    /// declares. Returns false when a type would have to be widened in *another* module, because publishing
+    /// another assembly's stubs as public is measured to be far worse than leaving the member as it is.
+    /// </summary>
+    private static bool MakeSignatureExpressible(MethodSignature? signature, ModuleDefinition module, ref int widenedTypes)
+    {
+        if (signature == null)
+            return true;
+
+        var localTypes = module.GetAllTypes().ToHashSet();
+
+        foreach (var referenced in ReferencedTypeDefinitions(signature.ReturnType)
+                     .Concat(signature.ParameterTypes.SelectMany(ReferencedTypeDefinitions))
+                     .Distinct())
+        {
+            if (IsPubliclyReachable(referenced))
+                continue;
+
+            if (!localTypes.Contains(referenced))
+                return false;
+
+            // The declaring chain has to be public too, or the nested type stays just as unreachable.
+            for (var current = referenced; current != null; current = current.DeclaringType as TypeDefinition)
+            {
+                var wanted = current.IsNested ? TypeAttributes.NestedPublic : TypeAttributes.Public;
+                if ((current.Attributes & TypeAttributes.VisibilityMask) == wanted)
+                    continue;
+
+                current.Attributes = (current.Attributes & ~TypeAttributes.VisibilityMask) | wanted;
+                widenedTypes++;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsPubliclyReachable(TypeDefinition definition)
+    {
+        for (var current = definition; current != null; current = current.DeclaringType as TypeDefinition)
+        {
+            var wanted = current.IsNested ? TypeAttributes.NestedPublic : TypeAttributes.Public;
+            if ((current.Attributes & TypeAttributes.VisibilityMask) != wanted)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>Every type a signature mentions, including generic arguments and element types.</summary>
+    private static IEnumerable<TypeDefinition> ReferencedTypeDefinitions(TypeSignature? signature)
+    {
+        switch (signature)
+        {
+            case null:
+                yield break;
+            case GenericInstanceTypeSignature generic:
+                foreach (var definition in ReferencedTypeDefinitions(generic.GenericType.ToTypeSignature(false)))
+                    yield return definition;
+                foreach (var argument in generic.TypeArguments)
+                    foreach (var definition in ReferencedTypeDefinitions(argument))
+                        yield return definition;
+                yield break;
+            case SzArrayTypeSignature array:
+                foreach (var definition in ReferencedTypeDefinitions(array.BaseType))
+                    yield return definition;
+                yield break;
+            case ByReferenceTypeSignature byRef:
+                foreach (var definition in ReferencedTypeDefinitions(byRef.BaseType))
+                    yield return definition;
+                yield break;
+            case PointerTypeSignature pointer:
+                foreach (var definition in ReferencedTypeDefinitions(pointer.BaseType))
+                    yield return definition;
+                yield break;
+            case TypeDefOrRefSignature { Type: TypeDefinition definition }:
+                yield return definition;
+                yield break;
+        }
     }
 
     // [0]=clean [1]=placeholder [2]=analysis exception [3]=skipped engine assembly
