@@ -7,7 +7,6 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using AsmResolver.DotNet;
-using AsmResolver.DotNet.Signatures;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
@@ -104,21 +103,14 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                 // (B1 468 -> 5,641) let the emitted stubs publish the same names as the real BCL/engine
                 // assemblies the consumer references, so references rebound to the stubs; widening only
                 // nested types (B1 468 -> 561) traded CS0052 -12 for CS0122 +39, CS0426 +16, CS0030 +31.
-                //
-                // Instead the field gives way to its own type: a field may not be more accessible than the
-                // type it exposes (CS0052), so a field whose type is not public becomes internal rather
-                // than public. Same-assembly access - which is where these fields are actually read - still
-                // works, and the type stays exactly as the metadata described it.
+                // The inconsistent-accessibility cases (CS0052, 140) stay, and are the cheaper trade.
+
                 foreach (var field in type.Fields)
                 {
-                    var wanted = IsTypeAccessible(field.Signature?.FieldType)
-                        ? FieldAttributes.Public
-                        : FieldAttributes.Assembly;
-
-                    if ((field.Attributes & FieldAttributes.FieldAccessMask) == wanted)
+                    if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
                         continue;
 
-                    field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | wanted;
+                    field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | FieldAttributes.Public;
                     widenedFields++;
                 }
             }
@@ -126,24 +118,6 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
         Logger.InfoNewline($"[IlRecoverySafe] accessibility: {widenedFields} field(s) and {widenedTypes} type(s) widened to public; {renamedFields} field(s) renamed to avoid a member-name collision", "IlRecoverySafe");
     }
-
-    /// <summary>
-    /// Whether a field of this type may be public at all. A field cannot be more accessible than the type
-    /// it exposes (CS0052), so this reports false for internal, nested-private, and any generic instance
-    /// or array whose definition or arguments are not themselves accessible.
-    /// </summary>
-    private static bool IsTypeAccessible(TypeSignature? signature) => signature switch
-    {
-        null => true,
-        GenericInstanceTypeSignature generic =>
-            IsTypeAccessible(generic.GenericType.ToTypeSignature(false)) && generic.TypeArguments.All(IsTypeAccessible),
-        SzArrayTypeSignature array => IsTypeAccessible(array.BaseType),
-        TypeDefOrRefSignature { Type: TypeDefinition definition } =>
-            definition.IsNested ? definition.IsNestedPublic && IsTypeAccessible(definition.DeclaringType?.ToTypeSignature()) : definition.IsPublic,
-        ByReferenceTypeSignature byRef => IsTypeAccessible(byRef.BaseType),
-        PointerTypeSignature pointer => IsTypeAccessible(pointer.BaseType),
-        _ => true,
-    };
 
     // [0]=clean [1]=placeholder [2]=analysis exception [3]=skipped engine assembly
     private readonly ConcurrentDictionary<string, int[]> _perAssembly = new();
