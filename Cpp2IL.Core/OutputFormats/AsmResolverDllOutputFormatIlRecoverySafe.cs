@@ -99,13 +99,11 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                     renamedFields++;
                 }
 
-                // Nested types need NestedPublic; see ECMA-335 II.10.1.3 for the separate nested flag set.
-                var wanted = type.IsNested ? TypeAttributes.NestedPublic : TypeAttributes.Public;
-                if ((type.Attributes & TypeAttributes.VisibilityMask) != wanted)
-                {
-                    type.Attributes = (type.Attributes & ~TypeAttributes.VisibilityMask) | wanted;
-                    widenedTypes++;
-                }
+                // Types are deliberately NOT widened. Measured twice, both worse: widening every type
+                // (B1 468 -> 5,641) let the emitted stubs publish the same names as the real BCL/engine
+                // assemblies the consumer references, so references rebound to the stubs; widening only
+                // nested types (B1 468 -> 561) traded CS0052 -12 for CS0122 +39, CS0426 +16, CS0030 +31.
+                // The inconsistent-accessibility cases (CS0052, 140) stay, and are the cheaper trade.
 
                 foreach (var field in type.Fields)
                 {
