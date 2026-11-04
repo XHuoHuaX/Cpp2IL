@@ -59,9 +59,26 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         var renamedFields = 0;
         var widenedMethods = 0;
 
+        // Every emitted assembly is generated together, so member accessibility does not have to be solved by
+        // publishing members as public - which is what makes them expose internal types (CS0052). Instead the
+        // whole set is made into one another's friends, and members are only widened to internal. Nothing is
+        // published outside the set, so no reference can rebind to an emitted stub type.
+        var writtenAssemblies = assemblies
+            .Select(a => a.Name?.ToString())
+            .Where(name => !string.IsNullOrEmpty(name))
+            .ToList();
+
         foreach (var module in assemblies.Select(a => a.ManifestModule).OfType<ModuleDefinition>())
         {
-            foreach (var type in module.GetAllTypes())
+            var localTypes = module.GetAllTypes().ToHashSet();
+
+            // Let this module's internals be reachable from every other module of the set.
+            if (module.Assembly is { } assembly)
+                foreach (var friend in writtenAssemblies)
+                    if (!string.Equals(friend, assembly.Name?.ToString(), StringComparison.Ordinal))
+                        AddInternalsVisibleTo(module, friend);
+
+            foreach (var type in localTypes)
             {
                 // IL2CPP metadata keeps the compiler-generated backing field of an event, and that field
                 // carries the event's own name; emitting both declarations is CS0102. The C# decompiler
@@ -101,35 +118,39 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                     renamedFields++;
                 }
 
-                // Types are deliberately NOT widened. Measured twice, both worse: widening every type
-                // (B1 468 -> 5,641) let the emitted stubs publish the same names as the real BCL/engine
-                // assemblies the consumer references, so references rebound to the stubs; widening only
-                // nested types (B1 468 -> 561) traded CS0052 -12 for CS0122 +39, CS0426 +16, CS0030 +31.
-                // The inconsistent-accessibility cases (CS0052, 140) stay, and are the cheaper trade.
+                // Types are not published. Widening every type was measured twice and is far worse (B1 468 ->
+                // 5,641): the emitted stubs then carry the same names as the real BCL/engine assemblies the
+                // consumer references, so references rebind to the stubs. Nested-only was worse too
+                // (468 -> 561). What is left is making the *internals* of this set visible to each other,
+                // which is what the friend assemblies above do.
 
                 foreach (var field in type.Fields)
                 {
-                    if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
+                    // Best effort: raise the types this field exposes to at least internal, since an internal
+                    // field may not expose a nested-private type either (CS0052 again, one level down).
+                    MakeTypeExpressible(field.Signature?.FieldType, localTypes, ref widenedTypes);
+
+                    if ((field.Attributes & FieldAttributes.FieldAccessMask) is FieldAttributes.Public or FieldAttributes.Assembly)
                         continue;
 
-                    field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | FieldAttributes.Public;
+                    field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | FieldAttributes.Assembly;
                     widenedFields++;
                 }
 
-                // Methods are widened too. A public method may not expose a less-accessible parameter (CS0051) or
-                // return type (CS0050), so the types its signature mentions are widened with it - but only
-                // when they are declared in this same module. A type from another module cannot be widened
-                // here without publishing that assembly's stubs (measured, far worse), so in that case the
-                // method keeps its original accessibility instead of trading one error for another.
+                // Methods likewise stop at internal, which removes the need to reason about whether a public
+                // method may expose its parameter and return types (CS0050/CS0051) at all. The exception is
+                // virtual methods: an override may not change its base's accessibility (CS0507) and an
+                // implicit interface implementation has to be public (CS0737), so those go to public and keep
+                // whatever contract they already had.
                 foreach (var method in type.Methods)
                 {
-                    if ((method.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public)
+                    if ((method.Attributes & MethodAttributes.MemberAccessMask) is MethodAttributes.Public or MethodAttributes.Assembly)
                         continue;
 
-                    if (!MakeSignatureExpressible(method.Signature, module, ref widenedTypes))
-                        continue;
+                    MakeSignatureExpressible(method.Signature, localTypes, ref widenedTypes);
 
-                    method.Attributes = (method.Attributes & ~MethodAttributes.MemberAccessMask) | MethodAttributes.Public;
+                    var wanted = method.IsVirtual ? MethodAttributes.Public : MethodAttributes.Assembly;
+                    method.Attributes = (method.Attributes & ~MethodAttributes.MemberAccessMask) | wanted;
                     widenedMethods++;
                 }
             }
@@ -139,44 +160,87 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     }
 
     /// <summary>
-    /// Whether every type in this signature is namable at public visibility. Used to keep a widened member
-    /// from tripping the inconsistent-accessibility rules (CS0050/CS0051/CS0052/CS0053).
+    /// Raises every type this signature names to at least internal, so that an internal member exposes nothing
+    /// less reachable than itself (CS0050/CS0051/CS0052/CS0053). Returns false only when a type would have to
+    /// be raised in another module, which cannot be done from here.
     /// </summary>
-    /// <summary>
-    /// Makes every type named by this signature namable at public visibility, widening the ones this module
-    /// declares. Returns false when a type would have to be widened in *another* module, because publishing
-    /// another assembly's stubs as public is measured to be far worse than leaving the member as it is.
-    /// </summary>
-    private static bool MakeSignatureExpressible(MethodSignature? signature, ModuleDefinition module, ref int widenedTypes)
+    private static bool MakeSignatureExpressible(MethodSignature? signature, HashSet<TypeDefinition> localTypes, ref int widenedTypes)
     {
         if (signature == null)
             return true;
-
-        var localTypes = module.GetAllTypes().ToHashSet();
 
         foreach (var referenced in ReferencedTypeDefinitions(signature.ReturnType)
                      .Concat(signature.ParameterTypes.SelectMany(ReferencedTypeDefinitions))
                      .Distinct())
         {
-            if (IsPubliclyReachable(referenced))
+            if (!MakeTypeExpressible(referenced.ToTypeSignature(false), localTypes, ref widenedTypes))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Best-effort form of the above for a single type. Internal is the target, not public: the emitted set is
+    /// one another's friends, so internal is reachable and - unlike public - publishes nothing.
+    /// </summary>
+    private static bool MakeTypeExpressible(TypeSignature? signature, HashSet<TypeDefinition> localTypes, ref int widenedTypes)
+    {
+        if (signature == null)
+            return true;
+
+        foreach (var referenced in ReferencedTypeDefinitions(signature).Distinct())
+        {
+            if (IsInternallyReachable(referenced))
                 continue;
 
             if (!localTypes.Contains(referenced))
                 return false;
 
-            // The declaring chain has to be public too, or the nested type stays just as unreachable.
+            // The declaring chain has to be reachable too, or the nested type stays just as unreachable.
             for (var current = referenced; current != null; current = current.DeclaringType as TypeDefinition)
             {
-                var wanted = current.IsNested ? TypeAttributes.NestedPublic : TypeAttributes.Public;
-                if ((current.Attributes & TypeAttributes.VisibilityMask) == wanted)
+                if (VisibleAtLeastInternal(current))
                     continue;
 
-                current.Attributes = (current.Attributes & ~TypeAttributes.VisibilityMask) | wanted;
+                // Only a nested-private type is out of reach; top level is internal (NotPublic) by default.
+                current.Attributes = (current.Attributes & ~TypeAttributes.VisibilityMask) | TypeAttributes.NestedAssembly;
                 widenedTypes++;
             }
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Whether this type is visible at least to the emitted set. Top-level types always are (public or
+    /// internal); the one nested visibility that keeps a type private is NestedPrivate.
+    /// </summary>
+    private static bool IsInternallyReachable(TypeDefinition definition)
+    {
+        for (var current = definition; current != null; current = current.DeclaringType as TypeDefinition)
+            if (!VisibleAtLeastInternal(current))
+                return false;
+
+        return true;
+    }
+
+    private static bool VisibleAtLeastInternal(TypeDefinition definition)
+        => !definition.IsNested || (definition.Attributes & TypeAttributes.VisibilityMask) != TypeAttributes.NestedPrivate;
+
+    /// <summary>
+    /// Adds <c>[assembly: InternalsVisibleTo("friend")]</c>, which is what lets the emitted assemblies reach
+    /// each other's internal members. The emitted assemblies are unsigned, so no public key is required.
+    /// </summary>
+    private static void AddInternalsVisibleTo(ModuleDefinition module, string friendName)
+    {
+        var corLib = module.CorLibTypeFactory;
+        var attributeType = new TypeReference(corLib.CorLibScope, "System.Runtime.CompilerServices", "InternalsVisibleToAttribute");
+        var constructor = new MemberReference(attributeType, ".ctor",
+            MethodSignature.CreateInstance(corLib.Void, new TypeSignature[] { corLib.String }));
+        var signature = new CustomAttributeSignature(new CustomAttributeArgument(corLib.String, friendName));
+
+        module.Assembly!.CustomAttributes.Add(new CustomAttribute(constructor, signature));
     }
 
     private static bool IsPubliclyReachable(TypeDefinition definition)

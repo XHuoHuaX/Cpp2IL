@@ -515,6 +515,16 @@ public static class IlGenerator
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
 
+                // A class instance method cannot be invoked on a bool/int/struct, so an instance slot holding a
+                // value type means the receiver was versioned wrongly somewhere upstream - typically an x0
+                // that is both the receiver and the return register, resolved across a branch join. The
+                // output cannot compile either way (CS0030), so make the cause visible instead of letting it
+                // surface only as a mystifying cast in the generated C#.
+                if (targetMethod is { IsStatic: false, DeclaringType: { IsValueType: false } }
+                    && instruction.Operands.Count > thisParamIndex
+                    && instruction.Operands[thisParamIndex] is LocalVariable { Type.IsValueType: true } valueReceiver)
+                    context.AddWarning($"call to {targetMethod.Name} has a value-type receiver ({valueReceiver.Type!.FullName}), expected {targetMethod.DeclaringType!.FullName}");
+
                 // A parameterless constructor call on this very object, from inside its own constructor, is
                 // the base/self initialiser. C# expresses that in the constructor initialiser (`: base()`)
                 // and the compiler emits it implicitly when absent, so the *statement* form
