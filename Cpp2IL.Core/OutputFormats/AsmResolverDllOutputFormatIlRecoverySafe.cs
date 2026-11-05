@@ -137,20 +137,20 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                     widenedFields++;
                 }
 
-                // Methods likewise stop at internal, which removes the need to reason about whether a public
-                // method may expose its parameter and return types (CS0050/CS0051) at all. The exception is
-                // virtual methods: an override may not change its base's accessibility (CS0507) and an
-                // implicit interface implementation has to be public (CS0737), so those go to public and keep
-                // whatever contract they already had.
+                // Bisect step E2a: methods keep the baseline treatment - public, gated on a signature that can
+                // be expressed at that visibility - so the only variable under test is field visibility.
+                // Operators are the prime suspect for the earlier 1,489 errors: an internal user-defined
+                // operator is not usable as an operator from another assembly, which yields exactly the
+                // CS0019/CS0030 mix that dominated that run.
                 foreach (var method in type.Methods)
                 {
-                    if ((method.Attributes & MethodAttributes.MemberAccessMask) is MethodAttributes.Public or MethodAttributes.Assembly)
+                    if ((method.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public)
                         continue;
 
-                    MakeSignatureExpressible(method.Signature, localTypes, ref widenedTypes);
+                    if (!MakeSignatureExpressible(method.Signature, localTypes, ref widenedTypes))
+                        continue;
 
-                    var wanted = method.IsVirtual ? MethodAttributes.Public : MethodAttributes.Assembly;
-                    method.Attributes = (method.Attributes & ~MethodAttributes.MemberAccessMask) | wanted;
+                    method.Attributes = (method.Attributes & ~MethodAttributes.MemberAccessMask) | MethodAttributes.Public;
                     widenedMethods++;
                 }
             }
