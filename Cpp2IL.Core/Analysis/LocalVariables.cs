@@ -611,8 +611,15 @@ public static class LocalVariables
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;
-                case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
+                case OpCode.Add or OpCode.Subtract:
                     changed |= PropagateArithmetic(instruction, method);
+                    break;
+                // A product is never pointer arithmetic, so an integer operand really does make the result an
+                // integer. Without this the product of two ints stays untyped, degrades to object, and every
+                // later use becomes `object >> int`, `object + int` (CS0019) - the shifts are how the compiler
+                // spells those divisions in the original code.
+                case OpCode.Multiply:
+                    changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
                 case OpCode.Divide or OpCode.Modulo:
                     changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
