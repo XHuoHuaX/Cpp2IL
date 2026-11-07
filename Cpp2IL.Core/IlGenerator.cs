@@ -506,7 +506,10 @@ public static class IlGenerator
                 if (instruction.Operands[0] is not MethodAnalysisContext targetMethod)
                 {
                     if (instruction.Operands[0] is Immediate targetAddress)
+                    {
+                        ProbeAmbiguousCall(context, targetAddress.UnsignedValue);
                         instructions.Add(CilOpCodes.Ldstr, $"Method not found @{targetAddress.UnsignedValue:X}");
+                    }
                     else // Probably key function. Just the target, the full operand dump is huge and blows the 16MB #US heap limit
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unknown call target operand: {instruction.Operands[0]}"));
 
@@ -920,6 +923,34 @@ public static class IlGenerator
         }
 
         return definitions == 1 && definedByCall;
+    }
+
+    private static readonly bool AmbiguousCallProbeEnabled =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CPP2IL_AMBIGUOUS_CALL"));
+
+    /// <summary>
+    /// Diagnostic for calls that stayed unresolved: reports how the candidate set is shaped, which is what
+    /// decides whether any disambiguation rule can work at all. A set that shares machine code differs in
+    /// parameter types, not arity; a set that differs in arity is a different problem.
+    /// </summary>
+    private static void ProbeAmbiguousCall(MethodAnalysisContext context, ulong address)
+    {
+        if (!AmbiguousCallProbeEnabled || !context.AppContext.MethodsByAddress.TryGetValue(address, out var candidates))
+            return;
+
+        if (candidates.Count < 2)
+            return;
+
+        var arities = candidates.Select(c => c.Parameters.Count).Distinct().Count();
+        var declaringTypes = candidates.Select(c => c.DeclaringType?.FullName).Distinct().Count();
+        var statics = candidates.Select(c => c.IsStatic).Distinct().Count();
+
+        var shape = arities > 1 ? "differing_arity"
+            : declaringTypes > 1 ? "same_arity_diff_declaring_type"
+            : statics > 1 ? "same_arity_diff_staticness"
+            : "same_arity_diff_types";
+
+        Console.WriteLine($"[ambig]\t{address:X}\t{candidates.Count}\t{shape}\t{context.DeclaringType?.FullName}::{context.Name}");
     }
 
     /// <summary>Whether an operand reads register X0, directly or as an addressing base.</summary>
