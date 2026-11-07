@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -372,6 +373,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        PassSnapshot("StackAnalyzer");
 
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
         // blocks and would otherwise leave the dominator tree out of sync with the graph SSA sees.
@@ -380,72 +382,97 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Create locals
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
+        PassSnapshot("SsaForm.Build");
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
         FlagConditionRecovery.Run(this);
+        PassSnapshot("FlagConditionRecovery");
         DeadCodeEliminator.Run(this);
+        PassSnapshot("DeadCodeEliminator.1");
 
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.
         MetadataResolver.ResolveAll(this);
+        PassSnapshot("MetadataResolver.ResolveAll");
 
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
         KeyFunctionRecovery.Run(this);
+        PassSnapshot("KeyFunctionRecovery.1");
         DeadCodeEliminator.Run(this);
+        PassSnapshot("DeadCodeEliminator.2");
 
         // Delete any il2cpp_codegen_initialize_runtime_metadata/il2cpp_codegen_initialize_method
         MetadataInitGuardRemover.Run(this);
+        PassSnapshot("MetadataInitGuardRemover");
 
         // Delete inlined GC write barriers
         WriteBarrierRecovery.Run(this);
+        PassSnapshot("WriteBarrierRecovery");
 
         InjectedCheckRemover.Run(this);
+        PassSnapshot("InjectedCheckRemover");
 
         InterfaceDispatchRecovery.Run(this);
+        PassSnapshot("InterfaceDispatchRecovery");
 
         LocalVariables.ResolveTypesAndFields(this);
+        PassSnapshot("ResolveTypesAndFields");
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
         MetadataInitGuardRemover.RunRgctx(this);
+        PassSnapshot("Rgctx");
 
         MetadataInitGuardRemover.RewriteUnguardedInits(this);
+        PassSnapshot("RewriteUnguardedInits");
 
         // Needs type resolved for delegate locals
         DelegateInvokeRecovery.Run(this);
+        PassSnapshot("DelegateInvokeRecovery");
         BooleanFlagSimplifier.Run(this);
+        PassSnapshot("BooleanFlagSimplifier");
         DeadCodeEliminator.Run(this);
+        PassSnapshot("DeadCodeEliminator.3");
 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
+        PassSnapshot("SsaSimplifier.1");
 
         // Folding a constant exposes more to propagate
         for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
             SsaSimplifier.Run(this);
+        PassSnapshot("ConstantFolder");
 
         InternalCallGuardRemover.Run(this);
+        PassSnapshot("InternalCallGuardRemover");
         KeyFunctionRecovery.Run(this);
+        PassSnapshot("KeyFunctionRecovery.2");
 
         SsaForm.Remove(this);
+        PassSnapshot("SsaForm.Remove");
 
         // Phi removal leaves a copy per merged version, most of which can share one local
         CopyCoalescer.Run(this);
+        PassSnapshot("CopyCoalescer");
 
         // Now out of SSA: clean up the per-edge copies that phi removal introduced (a local can have
         // several definitions merging at a join here, so this pass propagates conservatively), then
         // drop dead locals.
         Simplifier.Simplify(this);
+        PassSnapshot("Simplifier");
         // A runtime class pointer in a type position (newobj/newarr/box/throw, or a GetTypeFromHandle
         // argument) denotes exactly one managed type; collapsing it is what lets the emitter produce real
         // C# instead of `(IntPtr)typeof(T)`. See docs/FINDING-014.
         ClassPointerOperandFolder.Run(this);
+        PassSnapshot("ClassPointerOperandFolder");
 
         // A noreturn raise helper's cold block reads as `return <exception instance>`, which can only be
         // rendered as a fake value; throwing is the faithful reconstruction (red line C5).
         ColdPathThrowRecovery.Run(this);
+        PassSnapshot("ColdPathThrowRecovery");
 
         // The class operand of a Newobj is a real type by now; give its destination that type. Running
         // this early (ResolveTypesAndFields) misses it, because the operand is still an address there.
@@ -453,26 +480,59 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
+        PassSnapshot("FloatLiteralRecovery");
 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
         ArrayRecovery.Run(this);
+        PassSnapshot("ArrayRecovery");
 
         LocalVariables.TypeAddressedLocals(this);
+        PassSnapshot("TypeAddressedLocals");
 
         ConstantBranchFolder.Run(this);
+        PassSnapshot("ConstantBranchFolder");
 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
+        PassSnapshot("EqualityBranchInverter");
 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);
+        PassSnapshot("CallArgumentTrimmer");
         DeadCodeEliminator.Run(this);
+        PassSnapshot("DeadCodeEliminator.final");
 
         LocalVariables.RemoveUnused(this);
+        PassSnapshot("RemoveUnused");
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
+
+    private static readonly string DumpAfterPassFilter = Environment.GetEnvironmentVariable("CPP2IL_DUMP_AFTER") ?? string.Empty;
+
+    /// <summary>
+    /// Diagnostic hook for bisecting which pass rewrites or drops an instruction. With
+    /// <c>CPP2IL_DUMP_AFTER</c> set to a substring (or <c>*</c>), the whole method's ISIL is printed after
+    /// every matching pass, so a value visible after the lift can be followed until it disappears.
+    /// Costs one string compare per pass when the variable is unset.
+    /// </summary>
+    private void PassSnapshot(string passName)
+    {
+        if (DumpAfterPassFilter.Length == 0 || ControlFlowGraph is not { } cfg)
+            return;
+
+        if (DumpAfterPassFilter != "*" && !passName.Contains(DumpAfterPassFilter, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var report = new StringBuilder();
+        report.AppendLine($"===== [after {passName}] {FullName}");
+
+        for (var i = 0; i < cfg.Instructions.Count; i++)
+            report.AppendLine($"    {i,4}: {cfg.Instructions[i]}");
+
+        Console.WriteLine(report.ToString());
+    }
 
     /// <summary>
     /// Diagnostic hook. When set by a diagnostic output format, <see cref="ReleaseAnalysisData"/>
