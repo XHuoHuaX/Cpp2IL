@@ -16,6 +16,13 @@ namespace Cpp2IL.Core;
 
 public static class IlGenerator
 {
+    /// <summary>
+    /// Comparisons already resolved by the whole-method pre-pass, keyed by instruction. The pre-pass
+    /// neutralises each folded type handle, which removes the single-use evidence the resolution reads, so the
+    /// answer is carried over instead of being recomputed at emit time.
+    /// </summary>
+    [ThreadStatic] private static Dictionary<Instruction, (IOperand Type, LocalVariable Obj)>? _foldedComparisons;
+
     private const string HelpersNamespace = "Cpp2ILInjected";
     private const string HelpersTypeName = "Cpp2ILHelpers";
     private const string NoteIssueMethodName = "NoteDecompilerIssue";
@@ -101,6 +108,33 @@ public static class IlGenerator
                     instruction.SetOperand(0, target.Instructions[0]);
             }
         }
+
+        // Resolve every folded comparison up front, then neutralise the type handle each one consumes. That
+        // handle's `Move local, typeof(T)` sits earlier in the instruction stream, so by the time the
+        // comparison is reached it has already been emitted as an unused `IntPtr p = (IntPtr)typeof(T)` - a
+        // cast C# does not have. Done here rather than skipped at emit time so a branch targeting it still
+        // lands on an instruction (a Nop). Results are cached, because neutralising the definition would
+        // otherwise destroy the single-use evidence the resolution needs.
+        var foldedComparisons = new Dictionary<Instruction, (IOperand Type, LocalVariable Obj)>();
+
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual))
+                continue;
+
+            if (!TryResolveExactTypeComparison(context, instruction, out var foldedType, out var foldedObject, out var consumedHandle))
+                continue;
+
+            foldedComparisons[instruction] = (foldedType, foldedObject);
+
+            if (consumedHandle == null)
+                continue;
+
+            consumedHandle.OpCode = OpCode.Nop;
+            consumedHandle.SetOperands();
+        }
+
+        _foldedComparisons = foldedComparisons;
 
         var body = new CilMethodBody()
         {
@@ -1284,15 +1318,23 @@ public static class IlGenerator
     /// comparison - i.e. it exists solely to carry the type. Matching shape (b) on operand types alone
     /// was measured worse (S33, CS0030 +537): plain object/object comparisons satisfy it too.
     /// </summary>
-    private static bool TryEmitExactTypeComparison(MethodAnalysisContext context, Instruction instruction, MethodDefinition method,
-        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    /// <summary>
+    /// Recognises the "object is exactly T" shape and returns the pieces the emission needs, or false.
+    ///
+    /// Split out of the emit path so a whole-method pre-pass can resolve every such comparison *before* any
+    /// instruction is emitted: the type handle each one consumes has to be neutralised, because its
+    /// `Move local, typeof(T)` otherwise becomes an unused `IntPtr p = (IntPtr)typeof(T)` - not C# at all.
+    /// Doing the neutralising first would destroy the single-use evidence this resolution depends on.
+    /// </summary>
+    private static bool TryResolveExactTypeComparison(MethodAnalysisContext context, Instruction instruction,
+        out IOperand typeOperand, out LocalVariable objLocal, out Instruction? consumedHandle)
     {
         var left = instruction.Operands[1];
         var right = instruction.Operands[2];
 
-        IOperand typeOperand;
-        LocalVariable objLocal;
-        Instruction? consumedHandle = null;
+        typeOperand = null!;
+        objLocal = null!;
+        consumedHandle = null;
 
         if (TryResolveSingleUseTypeHandle(context, left, out var leftType, out var leftDefinition)
             && TryResolveObjectSide(right, out var rightObject))
@@ -1306,6 +1348,18 @@ public static class IlGenerator
             (typeOperand, objLocal) = (right, leftLocal);
         else
             return false;
+
+        return true;
+    }
+
+    private static bool TryEmitExactTypeComparison(MethodAnalysisContext context, Instruction instruction, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (_foldedComparisons == null || !_foldedComparisons.TryGetValue(instruction, out var folded))
+            return false;
+
+        var typeOperand = folded.Type;
+        var objLocal = folded.Obj;
 
         var module = method.DeclaringModule!;
         var instructions = method.CilMethodBody!.Instructions;
@@ -1328,14 +1382,8 @@ public static class IlGenerator
 
         StoreToOperand(instruction.Operands[0], method, locals, writeLine);
 
-        // The handle's definition is now part of the comparison above. Leaving it would emit
-        // `IntPtr p = (IntPtr)typeof(T)`, a conversion C# does not have.
-        if (consumedHandle != null)
-        {
-            consumedHandle.OpCode = OpCode.Nop;
-            consumedHandle.SetOperands();
-        }
-
+        // The handle's definition was already neutralised by the pre-pass (it has to be, or it would have
+        // been emitted as `IntPtr p = (IntPtr)typeof(T)` before this comparison was reached).
         return true;
     }
 
