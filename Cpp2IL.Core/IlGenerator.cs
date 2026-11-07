@@ -543,11 +543,17 @@ public static class IlGenerator
 
                 // A call on a generic type instance has to reference that instance - see FINDING-010.
                 // Emitting the definition yields `call List`1::Add(!0)`, which no C# compiler can express.
+                //
+                // The instance normally is the receiver's own type, but a chained `base(...)` on a generic base
+                // is called through the *derived* receiver: `class SurfaceProperty : Property<Surface, bool>`
+                // calling `base(uniform, keywords)`. The closed instance is then the matching entry in the
+                // receiver's own base chain, which is what makes ILSpy render a constructor initialiser instead
+                // of `((Property<,>)(object)this)._002Ector(..)`. See docs/FINDING-030.
                 if (!targetMethod.IsStatic
                     && instruction.Operands.Count > thisParamIndex
-                    && DestinationType(instruction.Operands[thisParamIndex]) is GenericInstanceTypeAnalysisContext receiverInstance
                     && targetMethod.DeclaringType is { } callDeclaringType
                     && callDeclaringType.GenericParameters.Count > 0
+                    && InstanceForCall(callDeclaringType, DestinationType(instruction.Operands[thisParamIndex])) is { } receiverInstance
                     && receiverInstance.GenericArguments.Count == callDeclaringType.GenericParameters.Count)
                     importedMethod = targetMethod.ToMethodDescriptorOnInstance(receiverInstance);
 
@@ -1583,5 +1589,24 @@ public static class IlGenerator
             foreach (var m in instance.Methods.Where(m => m.Name == ".ctor"))
                 Console.WriteLine($"[ctor]\t    ctor params={m.Parameters.Count} full={m.FullName}");
         }
+    }
+    /// <summary>
+    /// The closed instantiation of <paramref name="declaring"/> that a call through
+    /// <paramref name="receiverType"/> targets: the receiver's own type when that is the instance, otherwise the
+    /// matching entry in its base chain.
+    ///
+    /// A chained constructor on a generic base is called through the derived receiver, so the instance is never
+    /// the receiver's own type there - without the base-chain step such a call emits the open declaration, which
+    /// no C# compiler can express and which also never chains the base constructor.
+    /// </summary>
+    private static GenericInstanceTypeAnalysisContext? InstanceForCall(TypeAnalysisContext declaring, TypeAnalysisContext? receiverType)
+    {
+        var declaringName = declaring.FullName;
+
+        for (var type = receiverType; type != null; type = type.BaseType)
+            if (type is GenericInstanceTypeAnalysisContext instance && instance.GenericType.FullName == declaringName)
+                return instance;
+
+        return null;
     }
 }
