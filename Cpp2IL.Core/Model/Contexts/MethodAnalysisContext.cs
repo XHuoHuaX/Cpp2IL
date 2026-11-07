@@ -385,6 +385,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.CreateAll(this);
         PassSnapshot("SsaForm.Build");
 
+        // Must run before the first dead-code pass: a homogeneous float aggregate is returned through one
+        // register per element, so the element loads are only reachable from here (see the recovery itself).
+        HomogeneousReturnRecovery.Run(this);
+        PassSnapshot("HomogeneousReturnRecovery");
+
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
