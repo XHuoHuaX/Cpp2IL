@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
@@ -276,6 +277,7 @@ public static class MetadataResolver
 
             callInstruction.SetOperand(0, singleTargetMethod);
             singleTargetMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(callInstruction, singleTargetMethod);
+            NoteGenericCoverage(method, target, singleTargetMethod);
         }
 
         method.ControlFlowGraph.MergeCallBlocks();
@@ -328,6 +330,7 @@ public static class MetadataResolver
             {
                 instruction.SetOperand(0, openGeneric);
                 openGeneric.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, openGeneric);
+                NoteGenericCoverage(method, target.UnsignedValue, openGeneric);
                 changed = true;
                 continue;
             }
@@ -597,6 +600,7 @@ public static class MetadataResolver
 
                 instruction.SetOperand(0, representedMethod);
                 representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
+                NoteGenericCoverage(method, target.UnsignedValue, representedMethod);
                 changed = true;
                 continue;
             }
@@ -720,6 +724,46 @@ public static class MetadataResolver
         }
 
         return null;
+    }
+
+    private static bool ContainsTypeParameter(TypeAnalysisContext? type) => type switch
+    {
+        null => false,
+        GenericParameterTypeAnalysisContext => true,
+        GenericInstanceTypeAnalysisContext instance => instance.GenericArguments.Any(ContainsTypeParameter)
+                                                    || ContainsTypeParameter(instance.GenericType),
+        _ => ContainsTypeParameter(type.DeclaringType),
+    };
+
+    private static readonly bool GenericCoverageProbeEnabled =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CPP2IL_GENERIC_COVERAGE"));
+
+    /// <summary>
+    /// Measures whether the by-address generic-implementation list can answer for calls bound to an open
+    /// generic definition. Coverage has to be known before any binding rule is worth writing: with no entry
+    /// there is nothing to bind, and the call stays unnamable however the rule is phrased.
+    /// </summary>
+    private static void NoteGenericCoverage(MethodAnalysisContext caller, ulong target, MethodAnalysisContext bound)
+    {
+        if (!GenericCoverageProbeEnabled)
+            return;
+
+        // "Unnamable" means the type mentions a type parameter, not that it is a definition: a shared body is
+        // bound as an *instance* whose arguments are the definition's own parameters (ScriptPlayable`1<T>),
+        // which cannot be written at a call site whose caller is not generic over them.
+        if (!ContainsTypeParameter(bound.DeclaringType) && bound.GenericParameters.Count == 0)
+            return;
+
+        var has = caller.AppContext.Binary.ConcreteGenericImplementationsByAddress.TryGetValue(target, out var impls);
+        var known = has ? impls!.Count : 0;
+
+        var inByRef = 0;
+        if (has)
+            for (var i = 0; i < impls!.Count; i++)
+                if (caller.AppContext.ConcreteGenericMethodsByRef.ContainsKey(impls[i]))
+                    inByRef++;
+
+        Console.WriteLine($"[generic-cov]\t{target:X}\t{known}\t{inByRef}\t{bound.FullName}");
     }
 
     private static MethodAnalysisContext BaseMethodOf(MethodAnalysisContext method) =>
