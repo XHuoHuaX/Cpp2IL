@@ -5,6 +5,7 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Logging;
@@ -505,6 +506,38 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         LocalVariables.RemoveUnused(this);
         PassSnapshot("RemoveUnused");
+        TypeMismatchProbe();
+    }
+
+    private static readonly bool TypeMismatchProbeEnabled =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CPP2IL_TYPE_MISMATCH"));
+
+    /// <summary>
+    /// Diagnostic: reports copies whose two sides have known types that cannot be assigned to each other.
+    /// Those are the out-of-SSA phis that merged values from different paths through one register, and they
+    /// surface later as impossible casts (`(T)flag`). One line per site, so they can be counted by kind.
+    /// </summary>
+    private void TypeMismatchProbe()
+    {
+        if (!TypeMismatchProbeEnabled || ControlFlowGraph is not { } cfg)
+            return;
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move } || instruction.Operands.Count != 2)
+                continue;
+
+            if (instruction.Operands[0] is not LocalVariable destination || destination.Type is not { } destinationType)
+                continue;
+
+            if (instruction.Operands[1] is not LocalVariable source || source.Type is not { } sourceType)
+                continue;
+
+            if (destinationType.IsAssignableTo(sourceType) || sourceType.IsAssignableTo(destinationType))
+                continue;
+
+            Console.WriteLine($"[mismatch]\t{DeclaringType?.FullName}::{Name}\t{destinationType.FullName}\t{sourceType.FullName}");
+        }
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
