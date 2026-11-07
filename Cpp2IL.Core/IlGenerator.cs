@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -547,7 +548,16 @@ public static class IlGenerator
 
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
-                    if ((instruction.Operands.Count - 1) >= thisParamIndex)
+                    // IL2CPP compiles the whole program, so a method that never looks at its receiver is also
+                    // called without one: the loading instruction is dropped and X0 still holds whatever the
+                    // previous call returned. Taking that as the receiver yields a call on a value of the
+                    // wrong type (CS0030) with a receiver the source never wrote. When the callee provably
+                    // ignores `this` the choice is free, so emit the enclosing `this` - what the source said.
+                    // See docs/FINDING-028.
+                    if ((instruction.Operands.Count - 1) >= thisParamIndex
+                        && EnclosingThis(context, targetMethod, instruction.Operands[thisParamIndex]) is { } enclosingThis)
+                        LoadOperand(enclosingThis, method, locals, writeLine, targetMethod.DeclaringType);
+                    else if ((instruction.Operands.Count - 1) >= thisParamIndex)
                         LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
                     else
                     {
@@ -824,6 +834,142 @@ public static class IlGenerator
         allocated is GenericInstanceTypeAnalysisContext instance
             ? constructor.ToMethodDescriptorOnInstance(instance)
             : constructor.ToMethodDescriptor();
+
+    /// <summary>
+    /// The enclosing method's own `this` when it is a valid receiver for <paramref name="callee"/>, i.e. only
+    /// when the callee never reads the receiver it is given. Returns null otherwise, so callers fall back to
+    /// the operand the lifter produced.
+    /// </summary>
+    private static LocalVariable? EnclosingThis(MethodAnalysisContext caller, MethodAnalysisContext callee, IOperand receiver)
+    {
+        if (caller.Locals.FirstOrDefault(l => l.IsThis) is not { } thisLocal || thisLocal.Type is not { } thisType)
+            return null;
+
+        // Already the enclosing instance: nothing to correct, and no need to look at the callee at all.
+        if (ReferenceEquals(receiver, thisLocal))
+            return null;
+
+        // Only the shape IL2CPP leaves behind is worth the callee inspection: the receiver slot still holds
+        // the previous call's return value, because no instruction ever loaded a real one. Anything else
+        // (a field, a parameter, an argument) is a receiver the source really wrote.
+        if (!IsCallResult(caller, receiver))
+            return null;
+
+        if (!CalleeIgnoresThis(callee))
+            return null;
+
+        return callee.DeclaringType is { } declaringType && thisType.IsAssignableTo(declaringType)
+            ? thisLocal
+            : null;
+    }
+
+    /// <summary>
+    /// Cache keyed by the method's native address, never by its context object: a concrete generic's context is
+    /// rebuilt on every lookup, so keying on it would miss every time and pin every instance (and its body) in
+    /// memory for the rest of the run. The address is stable, shared by a generic and its instantiations, and
+    /// costs one bool per method.
+    /// </summary>
+    private static readonly Dictionary<ulong, bool> CalleeIgnoresThisCache = [];
+
+    /// <summary>
+    /// Whether <paramref name="callee"/> provably never uses the `this` it is handed.
+    /// Only X0's first access decides: a read before any write means the receiver is used; a write before any
+    /// read means it is not; a branch reached first leaves it unknown and answers false.
+    /// Unknown always answers false - nothing is rewritten on a guess (red line C5).
+    /// </summary>
+    private static bool CalleeIgnoresThis(MethodAnalysisContext callee)
+    {
+        var key = callee.UnderlyingPointer;
+
+        if (key == 0)
+            return false;
+
+        lock (CalleeIgnoresThisCache)
+            if (CalleeIgnoresThisCache.TryGetValue(key, out var cached))
+                return cached;
+
+        var result = ComputeCalleeIgnoresThis(callee);
+
+        lock (CalleeIgnoresThisCache)
+            CalleeIgnoresThisCache[key] = result;
+
+        return result;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="operand"/> is a local whose only definition is a call's return value - i.e. the
+    /// receiver slot was never loaded with anything the source wrote.
+    /// </summary>
+    private static bool IsCallResult(MethodAnalysisContext caller, IOperand operand)
+    {
+        if (operand is not LocalVariable local || caller.ControlFlowGraph is not { } cfg)
+            return false;
+
+        var definitions = 0;
+        var definedByCall = false;
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (!ReferenceEquals(instruction.Destination, local))
+                continue;
+
+            if (++definitions > 1)
+                return false;
+
+            definedByCall = instruction.IsCall;
+        }
+
+        return definitions == 1 && definedByCall;
+    }
+
+    /// <summary>Whether an operand reads register X0, directly or as an addressing base.</summary>
+    private static bool MentionsX0(IOperand operand) => operand switch
+    {
+        Register { Name: "X0" } => true,
+        MemoryOperand { Base: Register { Name: "X0" } } => true,
+        _ => false,
+    };
+
+    private static bool ComputeCalleeIgnoresThis(MethodAnalysisContext callee)
+    {
+        try
+        {
+            // Lift only - never Analyze here: analysis can register new concrete generic methods, and the
+            // output format is enumerating the method collections while we run.
+            var isil = callee.AppContext.InstructionSet.GetIsilFromMethod(callee);
+
+            foreach (var instruction in isil)
+            {
+                var operands = instruction.Operands;
+                var isMove = instruction.OpCode == OpCode.Move;
+
+                // Any operand that mentions X0 - including as an addressing base - is a read of the
+                // incoming `this`, except the destination slot of a move.
+                for (var i = 0; i < operands.Count; i++)
+                {
+                    if (isMove && i == 0)
+                        continue;
+
+                    if (MentionsX0(operands[i]))
+                        return false;
+                }
+
+                // Past a branch we cannot say what reached X0.
+                if (instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.IndirectJump)
+                    return false;
+
+                // The prologue overwrote X0 before ever reading it.
+                if (isMove && operands.Count > 0 && MentionsX0(operands[0]))
+                    return true;
+            }
+        }
+        catch
+        {
+            // Undecodable body: assume it uses `this`, so nothing is rewritten on a guess.
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// The <c>(object, native int)</c> constructor a delegate's <c>newobj</c> must call, as a descriptor.
