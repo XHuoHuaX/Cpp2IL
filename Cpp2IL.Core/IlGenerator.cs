@@ -517,6 +517,8 @@ public static class IlGenerator
                     break;
                 }
 
+                ProbeCtorCall(context, targetMethod, instruction);
+
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
 
                 // A parameterless constructor call on this very object, from inside its own constructor, is
@@ -1540,6 +1542,46 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Pop);
                 break;
+        }
+    }
+    private static readonly bool CtorProbeEnabled =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CPP2IL_CTOR_PROBE"));
+
+    /// <summary>
+    /// Reports the real shape of a constructor call's declaring type, so a rule can be written from facts
+    /// instead of from what the type hierarchy is assumed to look like at emit time.
+    /// </summary>
+    private static void ProbeCtorCall(MethodAnalysisContext caller, MethodAnalysisContext callee, Instruction instruction)
+    {
+        if (!CtorProbeEnabled || callee.Name != ".ctor")
+            return;
+
+        var declaring = callee.DeclaringType;
+        var receiver = instruction.Operands.Count > (instruction.OpCode == OpCode.Call ? 2 : 1)
+            ? instruction.Operands[instruction.OpCode == OpCode.Call ? 2 : 1]
+            : null;
+
+        Console.WriteLine($"[ctor]\tcaller={caller.DeclaringType?.FullName}\tcallee={callee.FullName}");
+        Console.WriteLine($"[ctor]\t  declaringType CLR={declaring?.GetType().Name} full={declaring?.FullName} genParams={declaring?.GenericParameters.Count}");
+
+        if (declaring is GenericInstanceTypeAnalysisContext gi)
+            Console.WriteLine($"[ctor]\t  instance: genericType={gi.GenericType.FullName} args=[{string.Join(", ", gi.GenericArguments.Select(a => a.GetType().Name + ":" + a.FullName))}]");
+
+        Console.WriteLine($"[ctor]\t  receiver CLR={receiver?.GetType().Name} isThis={receiver is LocalVariable { IsThis: true }}");
+
+        var depth = 0;
+        for (var t = caller.DeclaringType?.BaseType; t != null && depth < 3; t = t.BaseType, depth++)
+        {
+            Console.WriteLine($"[ctor]\t  base[{depth}] CLR={t.GetType().Name} full={t.FullName}");
+
+            if (t is not GenericInstanceTypeAnalysisContext instance)
+                continue;
+
+            Console.WriteLine($"[ctor]\t    genericType full={instance.GenericType.FullName} sameName={instance.GenericType.FullName == declaring?.FullName}");
+            Console.WriteLine($"[ctor]\t    instance.Methods count={instance.Methods.Count}");
+
+            foreach (var m in instance.Methods.Where(m => m.Name == ".ctor"))
+                Console.WriteLine($"[ctor]\t    ctor params={m.Parameters.Count} full={m.FullName}");
         }
     }
 }
