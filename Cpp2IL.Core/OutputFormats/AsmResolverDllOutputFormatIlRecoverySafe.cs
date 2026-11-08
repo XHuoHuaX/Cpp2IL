@@ -52,8 +52,65 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
     /// Members that are not fields are left alone, deliberately. Widening a *method* can break the rule
     /// that an override keeps its base's accessibility (CS0507); fields and types have no such rule.
     /// </summary>
+    /// <summary>
+    /// Whether the emitted assemblies declare each other as friend assemblies.
+    ///
+    /// IL2CPP does not care about C# visibility: the native code reads every field of every type, across
+    /// assembly boundaries. Rebuilding that in C# needs some relaxation, and there are two ways to get it:
+    /// make the members public, or keep them internal and let the sibling assemblies in through
+    /// <c>InternalsVisibleTo</c>.
+    ///
+    /// Public is the one that costs: a public field may not name a type that is not publicly reachable, and
+    /// the type cannot be widened either (measured, far worse). That is exactly the CS0052 cluster. Internal
+    /// plus a friend declaration has no such constraint - see docs/EXPERIMENT-IVT-001.
+    /// </summary>
+    private static readonly bool UseFriendAssemblies = Environment.GetEnvironmentVariable("CPP2IL_IVT") == "1";
+
+    /// <summary>
+    /// Declares every emitted assembly as a friend of every other one, so `internal` members stay reachable
+    /// from the sibling assemblies the native code crossed freely.
+    /// </summary>
+    private static int DeclareFriendAssemblies(List<AssemblyDefinition> assemblies)
+    {
+        var names = assemblies
+            .Select(a => a.Name?.ToString())
+            .Where(n => !string.IsNullOrEmpty(n))
+            .Distinct()
+            .ToList();
+
+        var declared = 0;
+
+        foreach (var assembly in assemblies)
+        {
+            var own = assembly.Name?.ToString();
+
+            if (own == null || assembly.ManifestModule is not { } module)
+                continue;
+
+            var factory = module.CorLibTypeFactory;
+            var attributeType = factory.CorLibScope.CreateTypeReference("System.Runtime.CompilerServices", "InternalsVisibleToAttribute");
+            var constructor = attributeType.CreateMemberReference(".ctor",
+                MethodSignature.CreateInstance(factory.Void, [factory.String]));
+
+            foreach (var friend in names)
+            {
+                if (friend == own)
+                    continue;
+
+                var argument = new CustomAttributeArgument(factory.String, friend);
+                assembly.CustomAttributes.Add(new CustomAttribute((ICustomAttributeType)constructor,
+                    new CustomAttributeSignature(argument)));
+                declared++;
+            }
+        }
+
+        return declared;
+    }
+
     protected override void OnAssembliesBuilt(List<AssemblyDefinition> assemblies)
     {
+        var declaredFriends = UseFriendAssemblies ? DeclareFriendAssemblies(assemblies) : 0;
+
         var widenedFields = 0;
         var widenedTypes = 0;
         var renamedFields = 0;
@@ -107,6 +164,12 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                 // nested types (B1 468 -> 561) traded CS0052 -12 for CS0122 +39, CS0426 +16, CS0030 +31.
                 // The inconsistent-accessibility cases (CS0052, 140) stay, and are the cheaper trade.
 
+                // Fields stay public even when friend assemblies are declared. `internal` compiles fine (the
+                // friend declarations cover it) but the decompiler does not honour friend assemblies, so a
+                // field reached from another emitted assembly becomes invisible to it and the source it writes
+                // for that access is broken (measured: +45 CS0030, +31 CS0019, +28 CS0149, +14 CS0103).
+                // Public costs the CS0052 cluster, which is the cheaper of the two trades - see
+                // docs/EXPERIMENT-IVT-001.
                 foreach (var field in type.Fields)
                 {
                     if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
