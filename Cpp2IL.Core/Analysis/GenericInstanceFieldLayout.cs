@@ -16,10 +16,47 @@ public static class GenericInstanceFieldLayout
     private const int MaxNesting = 16;
 
     /// <summary>
-    /// Measured, not assumed: switching this to 4 (the "0x122 rounded to 0x124" reading of one
-    /// TweenerCore site) dropped the self-check from 27429 ok / 1336 miss to 11594 / 17171. Eight is
-    /// the rule; whatever explains that site, it is not a smaller alignment.
+    /// The extended layout walk is behind a switch, default off.
+    ///
+    /// It measures 97.75% correct against real metadata, and that is not enough: the part that is
+    /// wrong returns a *wrong* field rather than none, which types a load as the wrong member and
+    /// costs the whole method its clean recovery - enabling it took clean from 27430 to 27142.
+    /// Default off keeps that from happening; turn it on once the self-check reaches 100%.
     /// </summary>
+    private static readonly bool UseExtendedLayout = Environment.GetEnvironmentVariable("CPP2IL_GENERIC_LAYOUT") == "1";
+
+    /// <summary>
+    /// The original, conservative walk: only when no base class has fields, and only when every field
+    /// type has a known size. This is what runs by default.
+    /// </summary>
+    private static FieldAnalysisContext? FindFieldAtOffsetLegacy(TypeAnalysisContext definition, long targetOffset)
+    {
+        var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
+
+        for (var baseType = definition.BaseType; baseType != null; baseType = baseType.BaseType)
+            if (baseType.Fields.Any(f => !f.IsStatic))
+                return null;
+
+        var offset = 2L * pointerSize;
+
+        foreach (var field in definition.Fields)
+        {
+            if (field.IsStatic)
+                continue;
+
+            if (GetSizeAndAlignment(field.FieldType, pointerSize, EmptyMap, 0) is not var (size, alignment))
+                return null;
+
+            offset = Align(offset, alignment);
+
+            if (offset == targetOffset)
+                return field;
+
+            offset += size;
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Finds the instance field that starts exactly at <paramref name="targetOffset"/>.
@@ -34,6 +71,9 @@ public static class GenericInstanceFieldLayout
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset,
         IReadOnlyList<TypeAnalysisContext>? arguments = null)
     {
+        if (!UseExtendedLayout)
+            return FindFieldAtOffsetLegacy(definition, targetOffset);
+
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
 
         if (BuildSubstitution(definition, arguments) is not { } substitution)
@@ -43,15 +83,25 @@ public static class GenericInstanceFieldLayout
 
         for (var type = definition; type != null; type = type.BaseType)
         {
-            // A base class may re-order or wrap its arguments (`class A<T> : B<List<T>>`). Only the
-            // same-name case can be mapped through the single substitution table we have, so anything
-            // else is a miss rather than a guess.
             if (type == definition)
             {
                 chain.Insert(0, (type, substitution));
                 continue;
             }
 
+            // A base class is frequently a *closed* generic instance (`Task<int>`, `Tweener<int,int,…>`).
+            // Its arguments are on itself, not in the `arguments` list handed to this call - that list
+            // describes the definition we started from, and is empty when it is not generic at all.
+            if (type is GenericInstanceTypeAnalysisContext baseInstance)
+            {
+                if (BuildSubstitution(baseInstance.GenericType, baseInstance.GenericArguments) is not { } baseMap)
+                    return null;
+
+                chain.Insert(0, (baseInstance.GenericType, baseMap));
+                continue;
+            }
+
+            // An open base (`class A<T> : B<T>`): the arguments flow through by name.
             if (BuildSubstitution(type, arguments) is not { } baseSubstitution)
                 return null;
 
@@ -148,10 +198,12 @@ public static class GenericInstanceFieldLayout
         if (fieldType is PointerTypeAnalysisContext)
             return (pointerSize, pointerSize);
 
+        // An unmapped type parameter measures as a pointer, matching the original conservative rule -
+        // returning null here instead silently cost 87 clean recoveries on the default path.
         if (fieldType is GenericParameterTypeAnalysisContext parameter)
             return parameter.Name is { } name && map.TryGetValue(name, out var actual)
                 ? GetSizeAndAlignment(actual, pointerSize, map, depth + 1)
-                : null;
+                : (pointerSize, pointerSize);
 
         if (!fieldType.IsValueType)
             return (pointerSize, pointerSize);
@@ -176,15 +228,31 @@ public static class GenericInstanceFieldLayout
         // A user-defined value type: size is its fields laid out in order (no object header), padded
         // to its widest alignment. Explicit-layout structs would need their padding honoured and this
         // does not do that - if one shows up the self-check reports the mismatch.
+        //
+        // A generic instance carries no fields of its own - they live on the definition, with the
+        // arguments substituted. Getting that right is what makes Nullable<bool> measure 2 bytes
+        // instead of 0; at 0 every field laid out after it lands 8 bytes early.
+        var fieldsOwner = fieldType;
+        var fieldsMap = map;
+
+        if (fieldType is GenericInstanceTypeAnalysisContext genericInstance)
+        {
+            if (BuildSubstitution(genericInstance.GenericType, genericInstance.GenericArguments) is not { } instanceMap)
+                return null;
+
+            fieldsOwner = genericInstance.GenericType;
+            fieldsMap = instanceMap;
+        }
+
         long size = 0;
         long widest = 1;
 
-        foreach (var field in fieldType.Fields)
+        foreach (var field in fieldsOwner.Fields)
         {
             if (field.IsStatic)
                 continue;
 
-            if (GetSizeAndAlignment(Substitute(field.FieldType, map), pointerSize, map, depth + 1) is not var (innerSize, innerAlignment))
+            if (GetSizeAndAlignment(Substitute(field.FieldType, fieldsMap), pointerSize, fieldsMap, depth + 1) is not var (innerSize, innerAlignment))
                 return null;
 
             size = Align(size, innerAlignment) + innerSize;
@@ -197,6 +265,42 @@ public static class GenericInstanceFieldLayout
     }
 
     private static long Align(long value, long alignment) => alignment <= 1 ? value : (value + alignment - 1) & ~(alignment - 1);
+
+    /// <summary>
+    /// Diagnostic (<c>CPP2IL_FIELD_TYPES=&lt;type-substring&gt;</c>): prints each field with its metadata
+    /// offset and what the sizer decides about it, next to what the sizer computed. This is how a
+    /// self-check miss gets attributed to a specific field type instead of guessed at.
+    /// </summary>
+    public static void ProbeFieldTypes(ApplicationAnalysisContext appContext, string filter)
+    {
+        var pointerSize = appContext.Binary.PointerSizeBytes;
+
+        foreach (var assembly in appContext.Assemblies)
+            foreach (var type in assembly.Types)
+            {
+                if (!type.FullName.Contains(filter, StringComparison.Ordinal))
+                    continue;
+
+                System.Console.WriteLine($"[field-types] {type.FullName} base={(type.BaseType == null ? "-" : type.BaseType.FullName)} value={type.IsValueType}");
+
+                var offset = 2L * pointerSize;
+
+                foreach (var field in type.Fields)
+                {
+                    if (field.IsStatic)
+                        continue;
+
+                    var fieldType = field.FieldType;
+                    var measured = GetSizeAndAlignment(fieldType, pointerSize, EmptyMap, 0);
+                    var ownText = measured is { } m ? $"size={m.Size} align={m.Alignment} mine=0x{Align(offset, m.Alignment):X}" : "size=?";
+
+                    System.Console.WriteLine($"[field-types]\t{field.Name}\tmeta=0x{field.Offset:X}\t{fieldType.FullName}\tvalue={fieldType.IsValueType}\t{fieldType.GetType().Name}\t{ownText}");
+
+                    if (measured is { } m2)
+                        offset = Align(offset, m2.Alignment) + m2.Size;
+                }
+            }
+    }
 
     /// <summary>
     /// Checks the layout arithmetic against metadata that actually carries offsets.

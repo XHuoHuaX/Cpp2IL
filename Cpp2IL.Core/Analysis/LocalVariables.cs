@@ -356,14 +356,21 @@ public static class LocalVariables
         if (System.Environment.GetEnvironmentVariable("CPP2IL_ADD_PROBE") is { Length: > 0 } probeFilter)
             ProbeAddOffsets(method, probeFilter);
 
-        if (System.Environment.GetEnvironmentVariable("CPP2IL_LAYOUT_CHECK") == "1" && !_layoutChecked)
+        if (!_layoutChecked && System.Environment.GetEnvironmentVariable("CPP2IL_LAYOUT_CHECK") == "1")
         {
             _layoutChecked = true;
             GenericInstanceFieldLayout.SelfCheck(method.AppContext);
         }
+
+        if (!_fieldTypesProbed && System.Environment.GetEnvironmentVariable("CPP2IL_FIELD_TYPES") is { Length: > 0 } fieldTypeFilter)
+        {
+            _fieldTypesProbed = true;
+            GenericInstanceFieldLayout.ProbeFieldTypes(method.AppContext, fieldTypeFilter);
+        }
     }
 
     private static bool _layoutChecked;
+    private static bool _fieldTypesProbed;
 
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
     // the local - an Il2CppClass*, not an instance of T. That is known exactly from the instruction,
