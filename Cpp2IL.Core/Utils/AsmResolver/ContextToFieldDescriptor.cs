@@ -11,7 +11,7 @@ public static class ContextToFieldDescriptor
         return context.GetExtraData<FieldDefinition>("AsmResolverField") ?? throw new($"AsmResolver field not found in method analysis context for {context}");
     }
 
-    private static FieldSignature ToFieldSignature(this FieldAnalysisContext context)
+    internal static FieldSignature ToFieldSignature(this FieldAnalysisContext context)
     {
         return new FieldSignature(context.ToTypeSignature());
     }
@@ -25,9 +25,21 @@ public static class ContextToFieldDescriptor
 
     public static IFieldDescriptor ToFieldDescriptor(this ConcreteGenericFieldAnalysisContext context)
     {
+        // The signature has to be the *instantiated* one. Using the base field's signature emits
+        // `TweenerCore<T1,T2,TPOptions>::endValue` - a reference to a field on the open definition -
+        // which is not legal IL for an instance whose owner is closed. That is what produced source like
+        // ((TweenerCore<, , >)(object)t).endValue.
+        //
+        // The owner needs the same care: DeclaringType is typed as TypeAnalysisContext, so calling
+        // ToTypeSignature() on it binds the *base* overload and produces the open definition again -
+        // overload resolution is static, so the generic-instance overload is only reached by matching.
+        var owner = context.DeclaringType is GenericInstanceTypeAnalysisContext generic
+            ? generic.ToTypeSignature()
+            : context.DeclaringType.ToTypeSignature();
+
         return new MemberReference(
-            context.DeclaringType.ToTypeSignature().ToTypeDefOrRef(),
+            owner.ToTypeDefOrRef(),
             context.Name,
-            context.BaseFieldContext.ToFieldSignature());
+            context.ToFieldSignature());
     }
 }
