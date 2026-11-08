@@ -164,18 +164,22 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                 // nested types (B1 468 -> 561) traded CS0052 -12 for CS0122 +39, CS0426 +16, CS0030 +31.
                 // The inconsistent-accessibility cases (CS0052, 140) stay, and are the cheaper trade.
 
-                // Fields stay public even when friend assemblies are declared. `internal` compiles fine (the
-                // friend declarations cover it) but the decompiler does not honour friend assemblies, so a
-                // field reached from another emitted assembly becomes invisible to it and the source it writes
-                // for that access is broken (measured: +45 CS0030, +31 CS0019, +28 CS0149, +14 CS0103).
-                // Public costs the CS0052 cluster, which is the cheaper of the two trades - see
-                // docs/EXPERIMENT-IVT-001.
+                // With friend assemblies declared, `internal` is enough: every assembly we emit can see it, and
+                // unlike `public` it may name a type that is not publicly reachable - which is exactly what
+                // CS0052 reports. That matters more than it looks: while a single CS0052 is present the
+                // assembly's method bodies are never compiled at all, so its error count is only the
+                // declaration phase and B1 reads far lower than the truth (see docs/FINDING-032).
+                //
+                // The cost is real and is paid here: once the declaration phase passes, the bodies compile
+                // and the errors they always had become visible. That is a truer number, not a regression.
+                var target = UseFriendAssemblies ? FieldAttributes.Assembly : FieldAttributes.Public;
+
                 foreach (var field in type.Fields)
                 {
                     if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
                         continue;
 
-                    field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | FieldAttributes.Public;
+                    field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | target;
                     widenedFields++;
                 }
 
