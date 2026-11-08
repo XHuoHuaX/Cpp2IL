@@ -107,6 +107,18 @@ public static class IlGenerator
         GenericInstanceTypeAnalysisContext generic => generic.ToTypeSignature(),
         _ => type.ToTypeSignature(),
     };
+    /// <summary>
+    /// The direct base type's constructor taking exactly <paramref name="parameterCount"/> parameters,
+    /// or null when there is none (or more than one, where the choice would be a guess).
+    /// </summary>
+    private static MethodAnalysisContext? FindBaseConstructorMatching(TypeAnalysisContext directBase, int parameterCount)
+    {
+        var matches = directBase.Methods
+            .Where(m => m is { Name: ".ctor", IsStatic: false } && m.Parameters.Count == parameterCount)
+            .ToList();
+
+        return matches.Count == 1 ? matches[0] : null;
+    }
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
     {
         var assembly = context.DeclaringType!.DeclaringAssembly;
@@ -595,6 +607,23 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Nop);
                     break;
                 }
+
+                // IL2CPP 会平坦化构造函数链：`Background : BackgroundBase : Product` 的 .ctor 可能直接调
+                // `Product::.ctor`，把中间那一层 `BackgroundBase::.ctor` 折叠掉。C# 不支持跳过基类构造 ——
+                // 只能写 `: base(...)`，而 base 永远是**直接基类**。照搬 IL 的目标就会得到
+                // `: base((CABase)ca)`（用 Product 的参数类型强转），而 BackgroundBase 要的是
+                // BackgroundBaseCA，于是 CS1503/CS7036 一片。
+                //
+                // 只在"当前是构造函数、目标也是构造函数、目标不是直接基类、直接基类有同参数个数的构造"
+                // 时才改。中间层被 IL2CPP 折叠，说明它对编译器而言等价于 `: base(原参数)`，
+                // 所以改回直接基类是在还原源码意图，不是猜。
+                if (targetMethod is { Name: ".ctor", IsStatic: false }
+                    && context.Name == ".ctor"
+                    && context.DeclaringType is { } self
+                    && self.BaseType is { } directBase
+                    && targetMethod.DeclaringType != directBase
+                    && FindBaseConstructorMatching(directBase, targetMethod.Parameters.Count) is { } directCtor)
+                    targetMethod = directCtor;
 
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
