@@ -23,6 +23,9 @@ public static class GenericInstanceFieldLayout
     /// costs the whole method its clean recovery - enabling it took clean from 27430 to 27142.
     /// Default off keeps that from happening; turn it on once the self-check reaches 100%.
     /// </summary>
+    /// <summary>Why the most recent <see cref="FindFieldAtOffset"/> returned null. Diagnostics only.</summary>
+    [ThreadStatic] public static string? LastMissReason;
+
     private static readonly bool UseExtendedLayout = Environment.GetEnvironmentVariable("CPP2IL_GENERIC_LAYOUT") == "1";
 
     /// <summary>
@@ -77,7 +80,10 @@ public static class GenericInstanceFieldLayout
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
 
         if (BuildSubstitution(definition, arguments) is not { } substitution)
+        {
+            LastMissReason = "definition-substitution";
             return null;
+        }
 
         var chain = new List<(TypeAnalysisContext Type, Dictionary<string, TypeAnalysisContext> Map)>();
 
@@ -95,7 +101,10 @@ public static class GenericInstanceFieldLayout
             if (type is GenericInstanceTypeAnalysisContext baseInstance)
             {
                 if (BuildSubstitution(baseInstance.GenericType, baseInstance.GenericArguments) is not { } baseMap)
+                {
+                    LastMissReason = "closed-base-substitution:" + baseInstance.FullName;
                     return null;
+                }
 
                 chain.Insert(0, (baseInstance.GenericType, baseMap));
                 continue;
@@ -103,7 +112,10 @@ public static class GenericInstanceFieldLayout
 
             // An open base (`class A<T> : B<T>`): the arguments flow through by name.
             if (BuildSubstitution(type, arguments) is not { } baseSubstitution)
+            {
+                LastMissReason = "open-base-substitution:" + type.FullName;
                 return null;
+            }
 
             chain.Insert(0, (type, baseSubstitution));
         }
@@ -117,7 +129,10 @@ public static class GenericInstanceFieldLayout
                     continue;
 
                 if (GetSizeAndAlignment(Substitute(field.FieldType, map), pointerSize, map, 0) is not var (size, alignment))
+                {
+                    LastMissReason = "unknown-size:" + field.FieldType.FullName;
                     return null;
+                }
 
                 offset = Align(offset, alignment);
 
@@ -316,6 +331,8 @@ public static class GenericInstanceFieldLayout
         var miss = 0;
         var skipped = 0;
         var failures = new List<string>();
+        var reasons = new Dictionary<string, int>(StringComparer.Ordinal);
+        var wrongField = 0;
 
         foreach (var assembly in appContext.Assemblies)
             foreach (var type in assembly.Types)
@@ -334,6 +351,7 @@ public static class GenericInstanceFieldLayout
                         continue;
                     }
 
+                    LastMissReason = null;
                     var found = FindFieldAtOffset(type, field.Offset);
 
                     if (ReferenceEquals(found, field))
@@ -344,12 +362,24 @@ public static class GenericInstanceFieldLayout
 
                     miss++;
 
+                    // A wrong field is worse than no field: it types a load as the wrong member. Keep
+                    // the two apart so the count that matters is visible on its own.
+                    var reason = found != null ? "wrong-field" : LastMissReason ?? "not-on-chain";
+
+                    if (found != null)
+                        wrongField++;
+
+                    reasons[reason] = reasons.TryGetValue(reason, out var seen) ? seen + 1 : 1;
+
                     if (failures.Count < 12)
-                        failures.Add($"{type.FullName}.{field.Name}@{field.Offset:X} -> {(found == null ? "null" : found.Name)}");
+                        failures.Add($"{type.FullName}.{field.Name}@{field.Offset:X} -> {(found == null ? "null" : found.Name)} [{reason}]");
                 }
             }
 
-        System.Console.WriteLine($"[LayoutCheck] ok={ok} miss={miss} skipped={skipped}");
+        System.Console.WriteLine($"[LayoutCheck] ok={ok} miss={miss} skipped={skipped} wrong={wrongField}");
+
+        foreach (var (reason, count) in reasons.OrderByDescending(pair => pair.Value))
+            System.Console.WriteLine($"[LayoutCheck-reason] {count}\t{reason}");
 
         foreach (var failure in failures)
             System.Console.WriteLine($"[LayoutCheck-fail] {failure}");
