@@ -157,6 +157,56 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
         return true;
     }
+    /// <summary>
+    /// Raises a field's named type - and its whole declaring chain - to internal visibility.
+    /// Only ever *raises to internal*, never to public: internal is enough for an internal field, and
+    /// publishing a type publicly is what rebinds references to our stubs.
+    /// </summary>
+    private static void RaiseFieldTypeToInternal(TypeSignature? type, ModuleDefinition module)
+    {
+        switch (type)
+        {
+            case SzArrayTypeSignature array:
+                RaiseFieldTypeToInternal(array.BaseType, module);
+                return;
+
+            case GenericInstanceTypeSignature generic:
+                RaiseTypeDefToInternal(generic.GenericType, module);
+                return;
+
+            case TypeDefOrRefSignature reference:
+                RaiseTypeDefToInternal(reference.Type, module);
+                return;
+        }
+    }
+
+    private static void RaiseTypeDefToInternal(ITypeDefOrRef? type, ModuleDefinition module)
+    {
+        if (type is not { } definition)
+            return;
+
+        var resolved = definition as TypeDefinition;
+
+        if (resolved == null)
+        {
+            if (definition.Resolve(module.RuntimeContext, out var found) != ResolutionStatus.Success || found == null)
+                return;
+
+            resolved = found;
+        }
+
+        // The chain has to move together, or the nested type stays as unreachable as before.
+        for (var current = resolved; current != null; current = current.DeclaringType as TypeDefinition)
+        {
+            var visibility = current.Attributes & TypeAttributes.VisibilityMask;
+
+            if (visibility is TypeAttributes.Public or TypeAttributes.NestedPublic or TypeAttributes.NotPublic or TypeAttributes.NestedAssembly)
+                continue;
+
+            var raised = current.IsNested ? TypeAttributes.NestedAssembly : TypeAttributes.NotPublic;
+            current.Attributes = (current.Attributes & ~TypeAttributes.VisibilityMask) | raised;
+        }
+    }
     protected override void OnAssembliesBuilt(List<AssemblyDefinition> assemblies)
     {
         var declaredFriends = UseFriendAssemblies ? DeclareFriendAssemblies(assemblies) : 0;
@@ -227,9 +277,15 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 // non-public type) is the only reason ten assemblies end up with bodies=SUPPRESSED, and that hides every
 // method-body error they have - see docs/FINDING-032. Whether this is safe depends on the decompiler,
 // which reads InternalsVisibleTo (S49), so it is an experiment switch rather than a policy.
-                var target = Environment.GetEnvironmentVariable("CPP2IL_FIELDS_INTERNAL") == "1"
-                    ? FieldAttributes.Assembly
-                    : FieldAttributes.Public;
+                // Fields are raised to *internal*, not public.
+                //
+                // public is what costs: a public field may not name a non-public type (CS0052, 66 of them),
+                // and public is also unnecessary - every emitted assembly is a friend of every other, so
+                // internal already covers cross-assembly access, and internal still covers access from
+                // another class in the same assembly, which is what the private fields actually needed
+                // (CS0122, 149 of them when widening is off). Unity serialisation treats internal exactly
+                // like private, so nothing about the data changes either.
+                var target = FieldAttributes.Assembly;
 
                 foreach (var field in type.Fields)
                 {
@@ -250,6 +306,13 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                     // which the decompiled code reads from other classes, and InternalsVisibleTo does not
                     // reach a same-assembly private. So skip exactly the fields whose type cannot be named
                     // publicly, and keep widening the rest.
+
+                    // An internal field may only name types that are at least internal. A *private nested*
+                    // type is stricter than that (`internal Level[] m_Pyramid` against
+                    // `private struct Level` is CS0052), so raise the named type to internal as well.
+                    // Raising it to internal - not public - is what keeps this from re-binding references
+                    // the way publishing stubs as public did.
+                    RaiseFieldTypeToInternal(field.Signature?.FieldType, module);
 
                     field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | target;
                     widenedFields++;
