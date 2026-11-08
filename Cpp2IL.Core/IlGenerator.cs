@@ -62,9 +62,19 @@ public static class IlGenerator
             return IsInScopeGenericParameter(context, type) ? type : context.AppContext.SystemTypes.SystemObjectType;
 
         if (type is GenericInstanceTypeAnalysisContext genericInstance)
+        {
+            // An argument list that is empty (or short) bypassed the check below entirely, because the
+            // loop body never runs - and the type was then emitted as `List<>`, which is not legal C#
+            // and produced CS7003 plus a cascade of CS0246/CS8370 from the same site. A generic instance
+            // whose arguments do not match its definition's parameters cannot be named, so it degrades
+            // like the other unresolvable cases rather than emitting an empty list.
+            if (genericInstance.GenericArguments.Count != genericInstance.GenericType.GenericParameters.Count)
+                return context.AppContext.SystemTypes.SystemObjectType;
+
             foreach (var argument in genericInstance.GenericArguments)
                 if (!IsInScopeGenericParameter(context, argument))
                     return context.AppContext.SystemTypes.SystemObjectType;
+        }
 
         return type;
     }
