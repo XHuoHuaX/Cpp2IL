@@ -262,6 +262,57 @@ public static class LocalVariables
     /// moves/phis). Both steps are monotonic - each only ever resolves an operand or fills a
     /// previously-unknown type - so the loop converges.
     /// </summary>
+    /// <summary>
+    /// Diagnostic (<c>CPP2IL_ADD_PROBE=&lt;type-substring&gt;</c>): reports whether the offset of an
+    /// `Add object, constant` would resolve to a field of the type being addressed.
+    ///
+    /// That shape is how a *value-type* field's address reaches the ISIL - the native code computes
+    /// `base + offset` so it can pass a byref, and nothing turns that back into a field. Before writing
+    /// the rewrite it is worth knowing whether the offset even lands on a field boundary: on a miss the
+    /// honest answer is to leave the method alone rather than invent one.
+    /// </summary>
+    private static void ProbeAddOffsets(MethodAnalysisContext method, string filter)
+    {
+        if (method.ControlFlowGraph is not { } cfg)
+            return;
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Add || instruction.Operands.Count != 3)
+                continue;
+
+            if (instruction.Operands[1] is not LocalVariable { Type: { } baseType })
+                continue;
+
+            if (instruction.Operands[2] is not Immediate offsetOperand)
+                continue;
+
+            if (!baseType.FullName.Contains(filter, System.StringComparison.Ordinal))
+                continue;
+
+            var offset = (int)offsetOperand.Value;
+            var matches = new List<string>();
+            var inventory = new List<string>();
+
+            // A generic instance carries no fields of its own - they live on the generic type definition.
+            // The offset is per-instantiation though (the same definition reports a different offset for
+            // Rect and for RectOffset), so the definition's fields are what has to be searched.
+            var declaring = baseType is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : baseType;
+
+            for (var type = declaring; type != null; type = type.BaseType)
+                foreach (var field in type.Fields)
+                {
+                    inventory.Add($"{field.Name}@{field.Offset:X}");
+
+                    if (field.Offset == offset)
+                        matches.Add($"{field.DeclaringType?.Name}.{field.Name}");
+                }
+
+            System.Console.WriteLine($"[add-probe]\t{method.DeclaringType?.Name}::{method.Name}\t{baseType.FullName}+{offset:X}\tmatches={matches.Count}\t{string.Join(" | ", matches.Take(3))}");
+            System.Console.WriteLine($"[add-probe-fields]\t{declaring?.FullName}\tf[{declaring?.Fields.Count}]\t{string.Join(" ", inventory.Take(24))}");
+        }
+    }
+
     public static void ResolveTypesAndFields(MethodAnalysisContext method)
     {
         // Seed types from fixed ground truth - the method's own signature, and type-metadata global
@@ -301,6 +352,9 @@ public static class LocalVariables
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
         }
+
+        if (System.Environment.GetEnvironmentVariable("CPP2IL_ADD_PROBE") is { Length: > 0 } probeFilter)
+            ProbeAddOffsets(method, probeFilter);
     }
 
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
