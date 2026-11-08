@@ -107,11 +107,62 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
         return declared;
     }
 
+    /// <summary>
+    /// Whether a field's declared type can be named from a public field without tripping CS0052.
+    ///
+    /// A type is nameable when it and its entire declaring chain are public; a private nested type is
+    /// not, so a field of that type must stay at its original visibility instead of being widened.
+    /// </summary>
+    private static bool IsPubliclyNameable(TypeSignature? type, ModuleDefinition module)
+    {
+        switch (type)
+        {
+            case null:
+                return false;
+
+            // Arrays and pointers take their accessibility from the element type.
+            case SzArrayTypeSignature array:
+                return IsPubliclyNameable(array.BaseType, module);
+
+            case GenericInstanceTypeSignature generic:
+                return IsDeclaredPubliclyReachable(generic.GenericType, module);
+
+            case TypeDefOrRefSignature reference:
+                return IsDeclaredPubliclyReachable(reference.Type, module);
+
+            // A corlib primitive or a generic parameter - nothing to hide.
+            default:
+                return true;
+        }
+    }
+
+    private static bool IsDeclaredPubliclyReachable(ITypeDefOrRef? type, ModuleDefinition module)
+    {
+        if (type is not { } definition)
+            return false;
+
+        var resolved = definition as TypeDefinition;
+
+        if (resolved == null)
+        {
+            if (definition.Resolve(module.RuntimeContext, out var found) != ResolutionStatus.Success || found == null)
+                return false;
+
+            resolved = found;
+        }
+
+        for (var current = resolved; current != null; current = current.DeclaringType as TypeDefinition)
+            if (!current.Attributes.HasFlag(TypeAttributes.Public) && !current.Attributes.HasFlag(TypeAttributes.NestedPublic))
+                return false;
+
+        return true;
+    }
     protected override void OnAssembliesBuilt(List<AssemblyDefinition> assemblies)
     {
         var declaredFriends = UseFriendAssemblies ? DeclareFriendAssemblies(assemblies) : 0;
 
         var widenedFields = 0;
+        var skippedFields = 0;
         var widenedTypes = 0;
         var renamedFields = 0;
         var widenedMethods = 0;
@@ -190,6 +241,7 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
                     if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
                         continue;
+
 
                     // Widening raises a field's *effective* accessibility, and if its type is a private
                     // nested type that then fails CS0052 - `internal Level[] m_Pyramid` against
