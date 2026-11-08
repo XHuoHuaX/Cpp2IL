@@ -181,8 +181,17 @@ public static class MetadataResolver
             var declaring = baseLocal.Type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : baseLocal.Type!;
             var arguments = baseLocal.Type is GenericInstanceTypeAnalysisContext generic ? generic.GenericArguments : null;
 
-            if (GenericInstanceFieldLayout.FindFieldAtOffset(declaring, addend, arguments) is not { } field)
+            if (GenericInstanceFieldLayout.FindFieldAtOffset(declaring, addend, arguments) is not { } foundField)
                 continue;
+
+            // The layout walk returns the field as declared on the generic *definition*. Emitting that
+            // names `TweenerCore<T1,T2,TPOptions>::endValue`, an owner that is open, which is not legal
+            // for an instance that is closed - ILSpy then has to cast the receiver and writes
+            // ((TweenerCore<, , >)(object)t).endValue. Wrapping it in the instantiation makes the
+            // reference name the closed type, which is what the IL always meant.
+            var field = baseLocal.Type is GenericInstanceTypeAnalysisContext instanceType
+                ? new ConcreteGenericFieldAnalysisContext(foundField, instanceType)
+                : foundField;
 
             // The address is only redeemed when it is consumed as the field's own value type. If the
             // destination was typed as something else, this is not that shape and rewriting it would be
