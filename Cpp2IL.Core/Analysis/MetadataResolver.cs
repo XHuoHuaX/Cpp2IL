@@ -205,6 +205,26 @@ public static class MetadataResolver
         return changed;
     }
 
+    /// <summary>
+    /// Whether this field's type is the same type the read is consumed as. A generic-parameter field
+    /// carries the parameter rather than the substituted type, so it cannot be compared here.
+    /// </summary>
+    private static bool FieldTypeMatches(FieldAnalysisContext field, TypeAnalysisContext consumedAs)
+    {
+        var declared = field.FieldType;
+
+        if (declared is GenericParameterTypeAnalysisContext)
+            return true;
+
+        if (declared.FullName.Equals(consumedAs.FullName, StringComparison.Ordinal))
+            return true;
+
+        // An enum and its underlying type are interchangeable at the IL level.
+        if (declared.IsEnumType)
+            return true;
+
+        return false;
+    }
     public static bool ResolveFieldOffsets(MethodAnalysisContext method)
     {
         var changed = false;
