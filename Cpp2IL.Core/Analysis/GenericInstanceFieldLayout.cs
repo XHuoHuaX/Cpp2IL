@@ -226,12 +226,14 @@ public static class GenericInstanceFieldLayout
         if (fieldType.IsEnumType && fieldType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying)
             return GetSizeAndAlignment(underlying.FieldType, pointerSize, map, depth + 1);
 
-        // Nullable<T> is off by exactly the padding of its own two members in every case the indirect
-        // check could observe (int and float read 12 where this computes 8, decimal 24 where it computes
-        // 20), so its layout is not modelled correctly and it is not worth guessing at. The check that
-        // found this is the only reason to trust the rest: closed off wholesale rather than special-cased.
+        // Nullable<T> is refused wholesale: the indirect check reads it as 12 bytes for int and 24 for
+        // decimal, while this computes 8 and 20. Both plausible repairs (widen the field alignment, or
+        // widen the struct alignment) fix it and break NativeArray<T> in the same step, so the shape is
+        // not understood well enough to model - refusing it is the honest answer, and the check records
+        // how many observations that costs (42).
         if (fieldType.FullName.StartsWith("System.Nullable`1", StringComparison.Ordinal))
             return null;
+
 
         switch (fieldType.FullName)
         {
@@ -285,6 +287,12 @@ public static class GenericInstanceFieldLayout
         var fieldsOwner = fieldType;
         var fieldsMap = map;
 
+        // IL2CPP lays the fields of a *generic* struct out against the pointer width, not against each
+        // field's natural alignment. Measured on Nullable<int>: it occupies 12 bytes (hasValue at 0, then
+        // 7 bytes of padding, then value at 8), where natural alignment would give 5 rounded to 8. That
+        // 12 is read straight off a non-generic struct that embeds it, so it is not a guess.
+        var minimumFieldAlignment = 1L;
+
         if (fieldType is GenericInstanceTypeAnalysisContext genericInstance)
         {
             if (BuildSubstitution(genericInstance.GenericType, genericInstance.GenericArguments) is not { } instanceMap)
@@ -292,6 +300,7 @@ public static class GenericInstanceFieldLayout
 
             fieldsOwner = genericInstance.GenericType;
             fieldsMap = instanceMap;
+            minimumFieldAlignment = 1;   // measured: widening this to the pointer size breaks NativeArray<T> (24 vs 16)
         }
 
         long size = 0;
@@ -305,7 +314,12 @@ public static class GenericInstanceFieldLayout
             if (GetSizeAndAlignment(Substitute(field.FieldType, fieldsMap), pointerSize, fieldsMap, depth + 1) is not var (innerSize, innerAlignment))
                 return null;
 
-            size = Align(size, innerAlignment) + innerSize;
+            // Offsets use the widened alignment; the struct's own alignment for the trailing padding
+            // stays natural. Without that split Nullable<int> comes out 16 instead of 12 - the value
+            // lands correctly at 8, then rounding the total up to 8 overshoots.
+            var fieldAlignment = Math.Max(innerAlignment, minimumFieldAlignment);
+
+            size = Align(size, fieldAlignment) + innerSize;
 
             if (innerAlignment > widest)
                 widest = innerAlignment;
