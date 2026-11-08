@@ -185,13 +185,19 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                     if ((field.Attributes & FieldAttributes.FieldAccessMask) == target)
                         continue;
 
-                    // Narrowing a field that was *already* public was tried (it is the only way to touch
-                    // the fields CS0052 actually comes from) and it is catastrophic: B1 327 -> 244733 and
-                    // SUPPRESSED 11 -> 21. Those fields are read by the engine assemblies, and making them
-                    // internal breaks that wholesale. So only fields that we would otherwise have widened
-                    // are touched, and CS0052 stays.
+                    if (Environment.GetEnvironmentVariable("CPP2IL_NO_FIELD_WIDENING") == "1")
+                        break;
+
                     if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
                         continue;
+
+                    // Widening raises a field's *effective* accessibility, and if its type is a private
+                    // nested type that then fails CS0052 - `internal Level[] m_Pyramid` against
+                    // `private struct Level`. Those were the 66 CS0052 errors. Widening also cannot simply
+                    // be switched off: 45 of them are same-assembly private fields (`Debugger._logPriority`)
+                    // which the decompiled code reads from other classes, and InternalsVisibleTo does not
+                    // reach a same-assembly private. So skip exactly the fields whose type cannot be named
+                    // publicly, and keep widening the rest.
 
                     field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | target;
                     widenedFields++;
