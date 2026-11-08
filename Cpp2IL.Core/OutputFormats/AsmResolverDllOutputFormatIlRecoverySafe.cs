@@ -172,6 +172,13 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
 
             case GenericInstanceTypeSignature generic:
                 RaiseTypeDefToInternal(generic.GenericType, module);
+
+                // A generic instance's accessibility is the minimum over the definition *and every type
+                // argument* - `List<PrivateNested>` is no more nameable than PrivateNested. Handling only
+                // the definition left 35 CS0052 behind, all of them of exactly that shape.
+                foreach (var argument in generic.TypeArguments)
+                    RaiseFieldTypeToInternal(argument, module);
+
                 return;
 
             case TypeDefOrRefSignature reference:
@@ -295,6 +302,12 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                     if (Environment.GetEnvironmentVariable("CPP2IL_NO_FIELD_WIDENING") == "1")
                         break;
 
+                    // Raise the named type first, for *every* field - including ones already public, which
+                    // the loop below skips. Those are the last 9 CS0052: a field that was public in the game
+                    // naming a private nested type (`HyperlinkText.HyperlinkInfo.clickAreas` of type
+                    // `List<ClickAreas>`) never entered the widening path, so its type was never raised.
+                    RaiseFieldTypeToInternal(field.Signature?.FieldType, module);
+
                     if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
                         continue;
 
@@ -307,12 +320,6 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                     // reach a same-assembly private. So skip exactly the fields whose type cannot be named
                     // publicly, and keep widening the rest.
 
-                    // An internal field may only name types that are at least internal. A *private nested*
-                    // type is stricter than that (`internal Level[] m_Pyramid` against
-                    // `private struct Level` is CS0052), so raise the named type to internal as well.
-                    // Raising it to internal - not public - is what keeps this from re-binding references
-                    // the way publishing stubs as public did.
-                    RaiseFieldTypeToInternal(field.Signature?.FieldType, module);
 
                     field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | target;
                     widenedFields++;
