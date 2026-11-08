@@ -361,6 +361,7 @@ public static class LocalVariables
         {
             _layoutChecked = true;
             GenericInstanceFieldLayout.SelfCheck(method.AppContext);
+            GenericInstanceFieldLayout.SelfCheckGenericSizes(method.AppContext);
         }
 
         if (!_fieldTypesProbed && System.Environment.GetEnvironmentVariable("CPP2IL_FIELD_TYPES") is { Length: > 0 } fieldTypeFilter)

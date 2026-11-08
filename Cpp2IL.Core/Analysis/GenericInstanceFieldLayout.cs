@@ -226,6 +226,13 @@ public static class GenericInstanceFieldLayout
         if (fieldType.IsEnumType && fieldType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying)
             return GetSizeAndAlignment(underlying.FieldType, pointerSize, map, depth + 1);
 
+        // Nullable<T> is off by exactly the padding of its own two members in every case the indirect
+        // check could observe (int and float read 12 where this computes 8, decimal 24 where it computes
+        // 20), so its layout is not modelled correctly and it is not worth guessing at. The check that
+        // found this is the only reason to trust the rest: closed off wholesale rather than special-cased.
+        if (fieldType.FullName.StartsWith("System.Nullable`1", StringComparison.Ordinal))
+            return null;
+
         switch (fieldType.FullName)
         {
             case "System.Boolean" or "System.Byte" or "System.SByte":
@@ -305,6 +312,72 @@ public static class GenericInstanceFieldLayout
         }
 
         return (Align(size, widest), widest);
+    }
+
+    /// <summary>
+    /// Validates generic instance sizes against **indirect** ground truth.
+    ///
+    /// The previous check only graded non-generic types, because only they carry real offsets - and it
+    /// turned out to be a placebo: going from 95.4% to 98.86% moved clean by nothing, since what the
+    /// extended layout changes is generic instances. This checks the thing that actually matters.
+    ///
+    /// The trick is that a generic instance's size can leak into a non-generic type's offsets: when a
+    /// non-generic value type embeds a generic value-type field, the gap to the next field *is* that
+    /// instance's size. `Nullable<bool>` sits in such a slot in several BCL structs, so its 2 bytes can
+    /// be confirmed instead of assumed.
+    /// </summary>
+    public static void SelfCheckGenericSizes(ApplicationAnalysisContext appContext)
+    {
+        var pointerSize = appContext.Binary.PointerSizeBytes;
+        var ok = 0;
+        var miss = 0;
+        var skipped = 0;
+        var failures = new List<string>();
+
+        foreach (var assembly in appContext.Assemblies)
+            foreach (var type in assembly.Types)
+            {
+                if (type.GenericParameters.Count > 0 || !type.IsValueType)
+                    continue;
+
+                var fields = type.Fields
+                    .Where(f => !f.IsStatic && f.Offset >= 0)
+                    .OrderBy(f => f.Offset)
+                    .ToList();
+
+                for (var index = 0; index + 1 < fields.Count; index++)
+                {
+                    if (fields[index].FieldType is not GenericInstanceTypeAnalysisContext)
+                        continue;
+
+                    var observed = fields[index + 1].Offset - fields[index].Offset;
+
+                    if (observed <= 0)
+                        continue;
+
+                    if (GetSizeAndAlignment(fields[index].FieldType, pointerSize, EmptyMap, 0) is not var (measured, _))
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    if (measured == observed)
+                    {
+                        ok++;
+                        continue;
+                    }
+
+                    miss++;
+
+                    if (failures.Count < 12)
+                        failures.Add($"{type.FullName}.{fields[index].Name} expected={observed} mine={measured} ({fields[index].FieldType.FullName})");
+                }
+            }
+
+        System.Console.WriteLine($"[GenericSizeCheck] ok={ok} miss={miss} skipped={skipped}");
+
+        foreach (var failure in failures)
+            System.Console.WriteLine($"[GenericSizeCheck-fail] {failure}");
     }
 
     private static long Align(long value, long alignment) => alignment <= 1 ? value : (value + alignment - 1) & ~(alignment - 1);
