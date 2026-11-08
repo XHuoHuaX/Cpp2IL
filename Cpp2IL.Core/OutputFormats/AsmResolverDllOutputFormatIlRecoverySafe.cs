@@ -172,10 +172,24 @@ public class AsmResolverDllOutputFormatIlRecoverySafe : AsmResolverDllOutputForm
                 //
                 // The cost is real and is paid here: once the declaration phase passes, the bodies compile
                 // and the errors they always had become visible. That is a truer number, not a regression.
-                var target = UseFriendAssemblies ? FieldAttributes.Assembly : FieldAttributes.Public;
+// Fields can be kept internal when friend assemblies are declared. CS0052 (a public field naming a
+// non-public type) is the only reason ten assemblies end up with bodies=SUPPRESSED, and that hides every
+// method-body error they have - see docs/FINDING-032. Whether this is safe depends on the decompiler,
+// which reads InternalsVisibleTo (S49), so it is an experiment switch rather than a policy.
+                var target = Environment.GetEnvironmentVariable("CPP2IL_FIELDS_INTERNAL") == "1"
+                    ? FieldAttributes.Assembly
+                    : FieldAttributes.Public;
 
                 foreach (var field in type.Fields)
                 {
+                    if ((field.Attributes & FieldAttributes.FieldAccessMask) == target)
+                        continue;
+
+                    // Narrowing a field that was *already* public was tried (it is the only way to touch
+                    // the fields CS0052 actually comes from) and it is catastrophic: B1 327 -> 244733 and
+                    // SUPPRESSED 11 -> 21. Those fields are read by the engine assemblies, and making them
+                    // internal breaks that wholesale. So only fields that we would otherwise have widened
+                    // are touched, and CS0052 stays.
                     if ((field.Attributes & FieldAttributes.FieldAccessMask) == FieldAttributes.Public)
                         continue;
 
