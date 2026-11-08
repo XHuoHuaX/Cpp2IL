@@ -132,6 +132,79 @@ public static class MetadataResolver
     /// typed (a field load types its result, which is the base of the next load), more offsets
     /// resolve, so this is re-run until it stops finding new fields.
     /// </summary>
+    /// <summary>
+    /// Rewrites `Add destination, base, constant` into a field reference when the constant is exactly
+    /// where a field starts on the base's type.
+    ///
+    /// This shape is how a **value-type** field's address is taken. The native code computes
+    /// `base + offset` so it can pass a byref `this` to an instance method of that value type
+    /// (`Rect get_x(this ref Rect)`) - see the `add x19, x1, #0x134` before a `Rect.get_x` call.
+    /// Cpp2IL models the addition literally, nothing types the destination, and the consumer call then
+    /// retypes it as the value type itself. The result is source that C# cannot express:
+    /// `Rect r = (Rect)(t + 308); ((Rect*)r)->x`.
+    ///
+    /// Naming the field removes the need for the address entirely: `t.endValue.x = v` compiles to
+    /// `ldflda` + `call set_x`, so both the read and the write land on the field itself.
+    ///
+    /// Only where the offset resolves to a field *and* that field's type is the value type the address
+    /// is consumed as. Anything else - an offset inside a field, an unresolved offset - is left alone
+    /// rather than guessed at.
+    /// </summary>
+    public static bool ResolveValueTypeFieldAddress(MethodAnalysisContext method)
+    {
+        var changed = false;
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Add || instruction.Operands.Count != 3)
+                continue;
+
+            if (instruction.Operands[0] is not LocalVariable destination)
+                continue;
+
+            var left = instruction.Operands[1];
+            var right = instruction.Operands[2];
+
+            LocalVariable baseLocal;
+            long addend;
+
+            if (left is LocalVariable { Type: not null } leftLocal && right is Immediate rightOffset)
+                (baseLocal, addend) = (leftLocal, rightOffset.Value);
+            else if (right is LocalVariable { Type: not null } rightLocal && left is Immediate leftOffset)
+                (baseLocal, addend) = (rightLocal, leftOffset.Value);
+            else
+                continue;
+
+            if (addend <= 0 || addend > int.MaxValue)
+                continue;
+
+            var declaring = baseLocal.Type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : baseLocal.Type!;
+            var arguments = baseLocal.Type is GenericInstanceTypeAnalysisContext generic ? generic.GenericArguments : null;
+
+            if (GenericInstanceFieldLayout.FindFieldAtOffset(declaring, addend, arguments) is not { } field)
+                continue;
+
+            // The address is only redeemed when it is consumed as the field's own value type. If the
+            // destination was typed as something else, this is not that shape and rewriting it would be
+            // a guess. A field declared with a type parameter carries that parameter as its type, so it
+            // cannot be compared against the substituted one - the field reference itself names it.
+            if (field.FieldType is not GenericParameterTypeAnalysisContext
+                && destination.Type != null
+                && !destination.Type.FullName.Equals(field.FieldType.FullName, StringComparison.Ordinal))
+                continue;
+
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(new List<IOperand> { destination, new FieldReference(field, baseLocal, (int)addend) });
+
+            if (destination.Type == null)
+                destination.Type = field.FieldType;
+
+            changed = true;
+        }
+
+        return changed;
+    }
+
     public static bool ResolveFieldOffsets(MethodAnalysisContext method)
     {
         var changed = false;
