@@ -435,7 +435,14 @@ public static class IlGenerator
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
                     if (!field.Field.IsStatic)
-                        LoadLocal(field.Local, method, locals);
+                    {
+                        // stfld 要的是对象的**地址**：值类型局部必须 ldloca。用 ldloc 压入的是值，
+                        // C# 于是把它渲染成 `((T*)(IntPtr)local)->field = x`，编译不过。
+                        if (field.Local.Type?.IsValueType == true)
+                            instructions.Add(CilOpCodes.Ldloca, locals[field.Local]);
+                        else
+                            LoadLocal(field.Local, method, locals);
+                    }
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
@@ -1618,7 +1625,13 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadLocal(field.Local, method, locals);
+
+                // 同上：值类型局部要取地址（ldloca），不是取值（ldloc）。
+                if (field.Local.Type?.IsValueType == true)
+                    instructions.Add(CilOpCodes.Ldloca, locals[field.Local]);
+                else
+                    LoadLocal(field.Local, method, locals);
+
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;
