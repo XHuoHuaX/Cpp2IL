@@ -240,6 +240,34 @@ public static class GenericInstanceFieldLayout
                 return (pointerSize, pointerSize);
         }
 
+        // A non-generic value type reports real offsets for its own fields; a generic instance reports 0
+        // for every one of them. Where the real offsets exist, use them: an explicit-layout union
+        // overlaps its members, so laying them out in sequence overstates the size. ValidationState
+        // showed exactly that - StateUnion measured 16 bytes instead of 4, which put HasMatched 12 bytes
+        // too far and mistyped every field after it.
+        if (fieldType is not GenericInstanceTypeAnalysisContext && fieldType.Fields.Any(f => !f.IsStatic && f.Offset >= 0))
+        {
+            long endOffset = 0;
+            long widestKnown = 1;
+
+            foreach (var field in fieldType.Fields)
+            {
+                if (field.IsStatic)
+                    continue;
+
+                if (GetSizeAndAlignment(Substitute(field.FieldType, map), pointerSize, map, depth + 1) is not var (knownSize, knownAlignment))
+                    return null;
+
+                if (field.Offset + knownSize > endOffset)
+                    endOffset = field.Offset + knownSize;
+
+                if (knownAlignment > widestKnown)
+                    widestKnown = knownAlignment;
+            }
+
+            return (Align(endOffset, widestKnown), widestKnown);
+        }
+
         // A user-defined value type: size is its fields laid out in order (no object header), padded
         // to its widest alignment. Explicit-layout structs would need their padding honoured and this
         // does not do that - if one shows up the self-check reports the mismatch.
@@ -309,7 +337,12 @@ public static class GenericInstanceFieldLayout
                     var measured = GetSizeAndAlignment(fieldType, pointerSize, EmptyMap, 0);
                     var ownText = measured is { } m ? $"size={m.Size} align={m.Alignment} mine=0x{Align(offset, m.Alignment):X}" : "size=?";
 
-                    System.Console.WriteLine($"[field-types]\t{field.Name}\tmeta=0x{field.Offset:X}\t{fieldType.FullName}\tvalue={fieldType.IsValueType}\t{fieldType.GetType().Name}\t{ownText}");
+                    // Only the disagreements: a correct run is a long list of matching numbers, and the
+                    // question is always "which field first goes wrong".
+                    var agrees = measured is { } mm && Align(offset, mm.Alignment) == field.Offset;
+
+                    if (!agrees)
+                        System.Console.WriteLine($"[field-types-miss]\t{field.Name}\tmeta=0x{field.Offset:X}\t{fieldType.FullName}\tvalue={fieldType.IsValueType}\t{fieldType.GetType().Name}\t{ownText}");
 
                     if (measured is { } m2)
                         offset = Align(offset, m2.Alignment) + m2.Size;
@@ -331,6 +364,7 @@ public static class GenericInstanceFieldLayout
         var miss = 0;
         var skipped = 0;
         var failures = new List<string>();
+        var wrongFailures = new List<string>();
         var reasons = new Dictionary<string, int>(StringComparer.Ordinal);
         var wrongField = 0;
 
@@ -371,8 +405,12 @@ public static class GenericInstanceFieldLayout
 
                     reasons[reason] = reasons.TryGetValue(reason, out var seen) ? seen + 1 : 1;
 
-                    if (failures.Count < 12)
-                        failures.Add($"{type.FullName}.{field.Name}@{field.Offset:X} -> {(found == null ? "null" : found.Name)} [{reason}]");
+                    // Wrong-field samples are worth more than null ones: null means "no answer", which
+                    // is safe, while a wrong field silently mistypes the member.
+                    if (found != null && wrongFailures.Count < 10)
+                        wrongFailures.Add($"{type.FullName}.{field.Name}@{field.Offset:X} -> {found.Name}@{found.Offset:X}");
+                    else if (found == null && failures.Count < 6)
+                        failures.Add($"{type.FullName}.{field.Name}@{field.Offset:X} -> null [{reason}]");
                 }
             }
 
@@ -380,6 +418,9 @@ public static class GenericInstanceFieldLayout
 
         foreach (var (reason, count) in reasons.OrderByDescending(pair => pair.Value))
             System.Console.WriteLine($"[LayoutCheck-reason] {count}\t{reason}");
+
+        foreach (var failure in wrongFailures)
+            System.Console.WriteLine($"[LayoutCheck-wrong] {failure}");
 
         foreach (var failure in failures)
             System.Console.WriteLine($"[LayoutCheck-fail] {failure}");
