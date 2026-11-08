@@ -494,6 +494,14 @@ public static class LocalVariables
         if (type == null || local.Type != null)
             return false;
 
+        // An open generic *definition* is not a value type. Taking one as a local's type produces a
+        // ClassSig naming something like `Seq`1` with no arguments, which is not legal C# and brings
+        // CS7003 with CS0246/CS8370 cascading off it. Refusing it here leaves the local unknown, and the
+        // emitter's own rule turns unknown into object - the same degradation it already applies to every
+        // type it cannot name.
+        if (type is { GenericParameters.Count: > 0 } and not GenericInstanceTypeAnalysisContext)
+            return false;
+
         local.Type = type;
         return true;
     }
@@ -910,6 +918,11 @@ public static class LocalVariables
             if (instruction.Destination is LocalVariable returnValue)
             {
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
+
+                // NOTE: substituting the receiver's arguments into the return type here was tried and
+                // reverted - it threw ArgumentOutOfRangeException on five methods (the operand layout is
+                // not uniform across call shapes). The open-definition refusal in SetTypeIfUnknown covers
+                // the same defect from the other end without touching operand indexing.
 
                 if (producedType != method.AppContext.SystemTypes.SystemVoidType)
                     changed |= SetTypeIfUnknown(returnValue, producedType);

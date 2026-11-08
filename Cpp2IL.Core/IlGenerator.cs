@@ -94,6 +94,19 @@ public static class IlGenerator
             [appContext.SystemTypes.SystemStringType]);
     }
 
+    /// <summary>
+    /// Signature for a local's type, taking the generic-instance overload when the type is one.
+    ///
+    /// `type.ToTypeSignature()` resolves statically, and TypeAnalysisContext's own overload returns the
+    /// *definition* - so a local of `Seq<TriggerCallback>` came out as a ClassSig naming `Seq`1`, an open
+    /// type, which is not legal C# and is where List&lt;&gt;/Seq&lt;&gt; in the output came from. Same trap as
+    /// the field owner in S67: the overload only reaches the instance version through a pattern match.
+    /// </summary>
+    private static TypeSignature ToLocalSignature(TypeAnalysisContext type) => type switch
+    {
+        GenericInstanceTypeAnalysisContext generic => generic.ToTypeSignature(),
+        _ => type.ToTypeSignature(),
+    };
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
     {
         var assembly = context.DeclaringType!.DeclaringAssembly;
@@ -201,7 +214,7 @@ public static class IlGenerator
             // the control flow intact.
             if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType
                                     && IsInScopeGenericParameter(context, local.Type))
-                ilType = SanitizeType(context, local.Type).ToTypeSignature();
+                ilType = ToLocalSignature(SanitizeType(context, local.Type));
             else
                 ilType = module.CorLibTypeFactory.Object;
 
