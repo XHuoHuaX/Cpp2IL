@@ -181,7 +181,7 @@ public static class MetadataResolver
             var declaring = baseLocal.Type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : baseLocal.Type!;
             var arguments = baseLocal.Type is GenericInstanceTypeAnalysisContext generic ? generic.GenericArguments : null;
 
-            if (GenericInstanceFieldLayout.FindFieldAtOffset(declaring, addend, arguments) is not { } foundField)
+            if (GenericInstanceFieldLayout.FindFieldAtOffset(declaring, addend, arguments, forceExtended: true) is not { } foundField)
                 continue;
 
             // The layout walk returns the field as declared on the generic *definition*. Emitting that
@@ -203,7 +203,9 @@ public static class MetadataResolver
                 continue;
 
             instruction.OpCode = OpCode.Move;
-            instruction.SetOperands(new List<IOperand> { destination, new FieldReference(field, baseLocal, (int)addend) });
+            // addressOf: the native code took this field's address to pass a byref this, so the
+            // reference has to stay an address - reading the value would make a setter write into a copy.
+            instruction.SetOperands(new List<IOperand> { destination, new FieldReference(field, baseLocal, (int)addend, addressOf: true) });
 
             if (destination.Type == null)
                 destination.Type = field.FieldType;

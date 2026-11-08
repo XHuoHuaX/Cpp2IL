@@ -72,9 +72,14 @@ public static class GenericInstanceFieldLayout
     /// <param name="targetOffset">Byte offset from the start of the object.</param>
     /// <param name="arguments">The instantiation's type arguments, in declaration order.</param>
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset,
-        IReadOnlyList<TypeAnalysisContext>? arguments = null)
+        IReadOnlyList<TypeAnalysisContext>? arguments = null, bool forceExtended = false)
     {
-        if (!UseExtendedLayout)
+        // Two callers want different things from this. ResolveFieldOffsets (a memory read through a
+        // reference-typed field) has always used the conservative walk and works; switching it to the
+        // extended one costs 305 clean recoveries. The value-type address rewrite has no other way to
+        // name anything at all, and with it B1 drops. So the switch stays off globally and is forced on
+        // for that caller alone.
+        if (!forceExtended && !UseExtendedLayout)
             return FindFieldAtOffsetLegacy(definition, targetOffset);
 
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;

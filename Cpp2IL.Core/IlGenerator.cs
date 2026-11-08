@@ -1241,7 +1241,11 @@ public static class IlGenerator
                     break;
 
                 LoadLocal(field.Local, method, locals);
-                instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
+
+                // ldflda when the consumer wants the field itself, ldfld when it wants the value. Taking
+                // the address keeps a later write pointed at the field; reading the value would make a
+                // setter store into the temporary.
+                instructions.Add(field.AddressOf ? CilOpCodes.Ldflda : CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
