@@ -148,8 +148,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
 
+        var tracePath = System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_LIFT");
         foreach (var instruction in insns)
+        {
+            if (!string.IsNullOrEmpty(tracePath))
+                System.IO.File.AppendAllText(tracePath,
+                    $"[ins] {instruction.Mnemonic} op0={instruction.Op0Kind}/{instruction.Op0Reg} op1={instruction.Op1Kind}/{instruction.Op1Reg} op2={instruction.Op2Kind}/{instruction.Op2Reg}\n");
             ConvertInstructionStatement(instruction, instructions, addresses, context);
+        }
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)

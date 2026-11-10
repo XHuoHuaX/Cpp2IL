@@ -76,7 +76,8 @@ public static class LocalVariables
         // unmanaged load. Without this the x64 backend drops ~71% of its bodies to
         // "Unmanaged memory load" (610,510 of 858,023 issues on a Unity 2018.2 x64 build).
         var slotLocals = new Dictionary<(Register, long), LocalVariable>();
-        foreach (var instruction in instructions)
+        var promoteSlots = System.Environment.GetEnvironmentVariable("CPP2IL_NO_SLOT_PROMOTE") != "1";
+        foreach (var instruction in promoteSlots ? instructions : System.Linq.Enumerable.Empty<Instruction>())
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
