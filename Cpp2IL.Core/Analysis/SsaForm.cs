@@ -282,7 +282,8 @@ public class SsaForm
                     // Taking a slot's address lets the callee assign it, so the slot stops holding anything that reached this point, UNLESS
                     // nothing reads it afterwards, in which case any write is unobservable and the callee is only reading the value it has now
                     if (instruction.Operands[i] is AddressOf { Target: Register addressed })
-                        instruction.SetOperand(i, new AddressOf(_clobbering.Contains(instruction)
+                        instruction.SetOperand(i, new AddressOf(
+                            _clobbering.Contains(instruction) && System.Environment.GetEnvironmentVariable("CPP2IL_NO_ADDR_CLOBBER") != "1"
                             ? NewName(addressed, definedHere)
                             : CurrentVersion(addressed.Number)));
                 }
