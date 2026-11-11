@@ -22,6 +22,10 @@ public static class DeadCodeEliminator
 
     public static void Run(ISILControlFlowGraph cfg)
     {
+        // Diagnostic switch: rule this pass out (or in) by experiment rather than by reading.
+        if (System.Environment.GetEnvironmentVariable("CPP2IL_NO_DCE") == "1")
+            return;
+
         // Removing a dead definition can make its operands dead in turn, so iterate to a fixpoint.
         // This is monotonic (each pass only nops instructions) and therefore always terminates.
         var changed = true;

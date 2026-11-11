@@ -15,6 +15,10 @@ public static class NewArm64Utils
         if (managed)
         {
             var startOfNext = appContext.GetAddressOfNextFunctionStart(virtAddress);
+            var tracePath0 = System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_LIFT");
+            if (!string.IsNullOrEmpty(tracePath0))
+                System.IO.File.AppendAllText(tracePath0,
+                    $"[body] va=0x{virtAddress:X} startOfNext=0x{startOfNext:X} managed=true\n");
 
             //We have to fall through to default behavior for the last method because we cannot accurately pinpoint its end
             if (startOfNext > 0)
@@ -29,6 +33,10 @@ public static class NewArm64Utils
 
                 return Disassemble(bytes, virtAddress);
             }
+
+            if (!string.IsNullOrEmpty(tracePath0))
+                System.IO.File.AppendAllText(tracePath0,
+                    $"[body] va=0x{virtAddress:X} startOfNext=0x{startOfNext:X} managed=true FALLTHROUGH(no next function)\n");
         }
 
         //Unmanaged function, look for first b
