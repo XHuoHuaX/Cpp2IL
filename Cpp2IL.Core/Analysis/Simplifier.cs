@@ -21,6 +21,10 @@ public static class Simplifier
 {
     public static void Simplify(MethodAnalysisContext method)
     {
+        // Diagnostic switch: rule this pass out (or in) by experiment rather than by reading.
+        if (System.Environment.GetEnvironmentVariable("CPP2IL_NO_SIMPLIFIER") == "1")
+            return;
+
         new SimplifierContext(method).Process();
     }
 
