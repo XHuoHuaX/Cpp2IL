@@ -50,6 +50,10 @@ public static class DeadCodeEliminator
                     if (useCounts.TryGetValue(destination, out var count) && count > 0)
                         continue;
 
+                    if (System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_DCE") == "1")
+                        System.IO.File.AppendAllText(@"F:\nixiang\forAI\IR-build\out\p0\dce_trace.txt",
+                            $"[dce] removed {instruction} (dest={destination}, register={destination.Register.Name ?? "-"})`n");
+
                     instruction.OpCode = OpCode.Nop;
                     instruction.SetOperands();
                     changed = true;
