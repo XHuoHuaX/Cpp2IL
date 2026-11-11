@@ -318,6 +318,10 @@ public class SsaForm
         {
             var operand = instruction.Operands[i];
 
+            if (operand is AddressOf addrProbe && System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_ADDR") == "1")
+                System.IO.File.AppendAllText(@"F:\nixiang\forAI\IR-build\out\p0\addr_trace.txt",
+                    $"[addr] instr={instruction} opType={operand.GetType().Name} targetType={addrProbe.Target?.GetType().Name ?? "null"} target={addrProbe.Target}`n");
+
             if (operand is Register register)
             {
                 instruction.SetOperand(i, CurrentVersion(register.Number));
