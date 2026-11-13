@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -18,10 +18,14 @@ public static class SsaSimplifier
         // local is defined at most once, so there is never a conflicting entry for the same key.
         var forwarded = new Dictionary<LocalVariable, IOperand>();
 
+        // Memory-resident slots are not in SSA: they are written many times in memory form, so neither
+        // forwarding their definitions nor folding their uses is sound (see FrameSlotEscape).
+        var resident = FrameSlotEscape.Collect(cfg);
+
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
                 if (instruction.OpCode == OpCode.Move
-                    && instruction.Operands[0] is LocalVariable dest
+                    && instruction.Operands[0] is LocalVariable dest && !FrameSlotEscape.IsResident(resident, dest)
                     && !parameterLocals.Contains(dest)
                     && IsForwardable(instruction.Operands[1]))
                     forwarded[dest] = instruction.Operands[1];
@@ -46,7 +50,7 @@ public static class SsaSimplifier
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
                 if (instruction.OpCode == OpCode.Move
-                    && instruction.Operands[0] is LocalVariable dest
+                    && instruction.Operands[0] is LocalVariable dest && !FrameSlotEscape.IsResident(resident, dest)
                     && forwarded.ContainsKey(dest)
                     && !reads.Contains(dest))
                 {

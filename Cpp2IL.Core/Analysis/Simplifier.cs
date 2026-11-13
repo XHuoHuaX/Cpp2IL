@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -75,6 +75,7 @@ public static class Simplifier
 
         private bool InlineConstantsSinglePass()
         {
+            var resident = FrameSlotEscape.Collect(_graph);
             var changed = false;
             var definitionCounts = CountDefinitions();
 
@@ -97,7 +98,7 @@ public static class Simplifier
                     var instruction = block.Instructions[i];
 
                     // If it's move and it moves something to local, replace and remove it
-                    if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
+                    if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local && !FrameSlotEscape.IsResident(resident, local))
                     {
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
@@ -138,6 +139,7 @@ public static class Simplifier
 
         private void InlineLocals()
         {
+            var resident = FrameSlotEscape.Collect(_graph);
             var definitionCounts = CountDefinitions();
 
             var visited = new HashSet<Block>();
@@ -159,7 +161,7 @@ public static class Simplifier
                     var instruction = block.Instructions[i];
 
                     // If it's move and it moves local to local, replace and remove it
-                    if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] })
+                    if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] } && !FrameSlotEscape.IsResident(resident, local))
                     {
                         // A local with several definitions is not in SSA form, so its value at a join
                         // depends on the path taken; don't carry this definition across that join.

@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -26,6 +26,10 @@ public static class DeadCodeEliminator
         if (System.Environment.GetEnvironmentVariable("CPP2IL_NO_DCE") == "1")
             return;
 
+        // A store into a memory-resident slot is observable through the pointer that escaped, even though
+        // no SSA version of the local reads it (see FrameSlotEscape, FINDING-039).
+        var memoryResident = FrameSlotEscape.Collect(cfg);
+
         // Removing a dead definition can make its operands dead in turn, so iterate to a fixpoint.
         // This is monotonic (each pass only nops instructions) and therefore always terminates.
         var changed = true;
@@ -48,6 +52,9 @@ public static class DeadCodeEliminator
                         continue;
 
                     if (useCounts.TryGetValue(destination, out var count) && count > 0)
+                        continue;
+
+                    if (FrameSlotEscape.IsResident(memoryResident, destination))
                         continue;
 
                     if (System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_DCE") == "1")

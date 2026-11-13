@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -20,6 +20,9 @@ public class SsaForm
 {
     // Per-register version stack (top = current version in the current dominator-tree path).
     private readonly Dictionary<int, Stack<Register>> _stacks = new();
+
+    // Frame slots whose address escaped: kept in memory form, never versioned (see FrameSlotEscape).
+    private HashSet<string> _memoryResident = new(System.StringComparer.Ordinal);
     // Per-register last-assigned version number.
     private readonly Dictionary<int, int> _counter = new();
     // An unversioned representative register per number, used to build phi nodes and the entry value.
@@ -168,7 +171,8 @@ public class SsaForm
 
     private void InsertPhiFunctions(ISILControlFlowGraph graph, DominatorInfo dominance)
     {
-        var defSites = GetDefinitionSites(graph);
+        _memoryResident = FrameSlotEscape.Collect(graph);
+        var defSites = GetDefinitionSites(graph, _memoryResident);
 
         foreach (var entry in defSites)
         {
@@ -202,7 +206,7 @@ public class SsaForm
         }
     }
 
-    private static Dictionary<int, HashSet<Block>> GetDefinitionSites(ISILControlFlowGraph graph)
+    private static Dictionary<int, HashSet<Block>> GetDefinitionSites(ISILControlFlowGraph graph, HashSet<string> memoryResident)
     {
         var defSites = new Dictionary<int, HashSet<Block>>();
 
@@ -211,6 +215,10 @@ public class SsaForm
             foreach (var operand in block.Def)
             {
                 if (operand is not Register register)
+                    continue;
+
+                // Memory-resident slots are not versioned, so they get no phi either.
+                if (FrameSlotEscape.IsResident(memoryResident, register))
                     continue;
 
                 if (!defSites.TryGetValue(register.Number, out var sites))
@@ -270,7 +278,9 @@ public class SsaForm
                     RewriteUses(instruction);
 
                 if (instruction.Destination is Register definition)
-                    instruction.Destination = NewName(definition, definedHere);
+                    instruction.Destination = FrameSlotEscape.IsResident(_memoryResident, definition)
+                        ? definition
+                        : NewName(definition, definedHere);
 
                 // Nothing to write the new version back into, but taking it off the stack is the point: reads
                 // after this one can't reach back past the call
