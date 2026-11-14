@@ -23,6 +23,12 @@ public abstract class BaseCallingConventionResolver
     protected abstract (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app);
 
     /// <summary>
+    /// 公开转发，供"按位宽分流"的包装 resolver 读取另一个 resolver 的寄存器表。
+    /// （protected 成员不能在别的实例上调用，而分流器需要拿 x64 那一份。）
+    /// </summary>
+    public (string[] Integer, string[] Float) RawRegistersFor(ApplicationAnalysisContext app) => RawRegisters(app);
+
+    /// <summary>
     /// How many argument slots a parameter occupies and which register file each one takes.
     /// One slot per parameter for most ABIs, but a homogeneous float aggregate spans one SIMD
     /// register per element (see <see cref="HomogeneousFloatAggregate"/>). <paramref name="emit"/>
@@ -69,6 +75,20 @@ public abstract class BaseCallingConventionResolver
     public void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
     {
         var app = resolved.AppContext;
+
+        var (rawInteger, rawFloat) = RawRegisters(app);
+
+        // 纯栈 ABI（x86 cdecl）：调用本身不携带任何参数操作数，参数在压栈时就写进内存了，
+        // 所以"按寄存器名重映射"这条路永远走不通 —— HasRawArgumentLayout 会以数量不符为由返回 false，
+        // 参数于是从未被附加。这里直接问 resolver 要栈槽操作数并挂上去。
+        // 依据见 docs/FINDING-045（x86 实测 ABI）与 FINDING-046（这条链断在哪一环）。
+        if (rawInteger.Length == 0 && rawFloat.Length == 0)
+        {
+            var stackArguments = ResolveForManaged(resolved);
+            if (stackArguments.Length > 0)
+                call.AddOperands(stackArguments);
+            return;
+        }
 
         if (!HasRawArgumentLayout(call, app))
             return;

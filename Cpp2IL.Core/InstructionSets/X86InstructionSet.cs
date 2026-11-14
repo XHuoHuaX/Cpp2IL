@@ -16,7 +16,40 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 {
     private static readonly MasmFormatter Formatter = new();
     private static readonly StringOutput Output = new();
-    private static readonly X64CallingConventionResolver CallingConventions = new();
+    private static readonly X64CallingConventionResolver X64Conventions = new();
+
+    // InstructionSetRegistry 给的是**单例**，所以 resolver 没法在构造时知道 binary 是 32 位还是 64 位。
+    // 但 resolver 的每个方法都带 context/app，于是在这里按 is32Bit 分流即可 —— 不用改基类，
+    // 也不用改任何调用点（它们都走 instructionSet.CallingConventionResolver）。
+    // 基类的 ResolveForUnmanaged / HasRawArgumentLayout / RemapRawArguments 内部会调 RawRegisters(app)，
+    // 而 RawRegisters 也拿到 app，所以这三处会自动跟着分流。
+    private sealed class BitnessCallingConventions : BaseCallingConventionResolver
+    {
+        private static readonly X86CallingConventionResolver X86 = new();
+
+        private static BaseCallingConventionResolver For(ApplicationAnalysisContext app)
+            // 默认关闭：x86 分支在机制上能跑，但下游消费不了栈槽参数（见 FINDING-047），
+            // 打开会把 clsy 的 clean 从 9222 打到 6276。所以保留代码、默认不启用，
+            // 用 CPP2IL_X86_ABI=1 显式打开以便继续开发。
+            => app.Binary.is32Bit && System.Environment.GetEnvironmentVariable("CPP2IL_X86_ABI") == "1"
+                ? X86
+                : X64Conventions;
+
+        public override ISIL.Register ReturnRegister(MethodAnalysisContext ctx) => For(ctx.AppContext).ReturnRegister(ctx);
+
+        public override bool ReturnsViaHiddenBuffer(MethodAnalysisContext ctx) => For(ctx.AppContext).ReturnsViaHiddenBuffer(ctx);
+
+        public override ISIL.Register? HiddenReturnBufferRegister(MethodAnalysisContext ctx) => For(ctx.AppContext).HiddenReturnBufferRegister(ctx);
+
+        public override ISIL.IOperand[] ResolveForManaged(MethodAnalysisContext ctx) => For(ctx.AppContext).ResolveForManaged(ctx);
+
+        protected override (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app)
+            => app.Binary.is32Bit ? ([], []) : X64Conventions.RawRegistersFor(app);
+    }
+
+    // 这个名字沿用原来的 CallingConventions：X86InstructionSet 里有十几处直接静态引用它
+    // （含 GetParameterOperandsFromMethod），让字段本身成为分流器，就不用逐处改调用点。
+    private static readonly BitnessCallingConventions CallingConventions = new();
 
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
 
