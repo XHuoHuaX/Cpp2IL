@@ -97,6 +97,51 @@ public static class LocalVariables
             }
         }
 
+        // x86 cdecl 的参数固定住在帧槽里，偏移由 ABI 直接给出，不需要和 ParameterOperands 匹配：
+        //   实例方法： [ebp+8]=this, [ebp+0xC]=arg0, [ebp+0x10]=arg1, …
+        //   静态方法： [ebp+8]=arg0, [ebp+0xC]=arg1, …
+        // 把这些槽贴上元数据里已知的类型，`slot_X + 字段偏移` 才可能被当成成员访问；
+        // 否则一律落进 "Unmanaged memory load"（clsy 26,095 处，占 placeholder 的 53%）。
+        // 这就是"让 x86 的栈参数真正挂到调用点上"——参数的身份靠 ABI 偏移确定（FINDING-049 §8）。
+        // 只作用于 32 位（x86 cdecl）；ARM64/x64 的路径完全不受影响。
+        if (method.AppContext.Binary.is32Bit)
+        {
+            void TypeSlot(int offset, TypeAnalysisContext? declared)
+            {
+                if (declared == null)
+                    return;
+
+                foreach (var kv in slotLocals)
+                {
+                    if (kv.Key.Item2 != offset)
+                        continue;
+
+                    if (kv.Value.Type == null)
+                        kv.Value.Type = declared;
+
+                    return;
+                }
+            }
+
+            // 结构体按值返回时，隐藏的目标指针最后压栈，占 [ebp+8]，整体右移一格。
+            var conventions = method.AppContext.InstructionSet.CallingConventionResolver;
+            var shift = conventions?.ReturnsViaHiddenBuffer(method) == true ? 4 : 0;
+
+            var cursor = 8 + shift;
+
+            if (!method.IsStatic)
+            {
+                TypeSlot(cursor, method.DeclaringType);
+                cursor += 4;
+            }
+
+            foreach (var parameter in method.Parameters)
+            {
+                TypeSlot(cursor, parameter.ParameterType);
+                cursor += 4;
+            }
+        }
+
         method.Locals = locals.Select(kv => kv.Value).Concat(slotLocals.Values).ToList();
 
         // 诊断用（CPP2IL_TRACE_SLOTMAP=1）：同一方法里把参数操作数和槽提升的键并排打出来，
