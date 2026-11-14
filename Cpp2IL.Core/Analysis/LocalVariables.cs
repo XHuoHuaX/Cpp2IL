@@ -147,6 +147,22 @@ public static class LocalVariables
 
         method.Locals = locals.Select(kv => kv.Value).Concat(slotLocals.Values).ToList();
 
+        // x87 栈顶：X86InstructionSet 用 st0 / st0_q 两个名字区分 dword / qword 载荷，
+        // 这里给它们贴上 float / double，发射端才知道按 4 / 8 字节读（FINDING-050）。
+        if (method.AppContext.Binary.is32Bit)
+        {
+            foreach (var local in method.Locals)
+            {
+                if (local.Type != null)
+                    continue;
+
+                if (local.Register.Name == "st0")
+                    local.Type = method.AppContext.SystemTypes.SystemSingleType;
+                else if (local.Register.Name == "st0_q")
+                    local.Type = method.AppContext.SystemTypes.SystemDoubleType;
+            }
+        }
+
         // 诊断用（CPP2IL_TRACE_SLOTMAP=1）：同一方法里把参数操作数和槽提升的键并排打出来，
         // 好让"参数索引 → 帧槽"的对应关系被**读到**而不是推理出来（FINDING-049 §7.5）。
         if (!string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_SLOTMAP")))
