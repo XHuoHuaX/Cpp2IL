@@ -573,6 +573,12 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 break;
             case Mnemonic.Addss:
             case Mnemonic.Subss:
+            // SSE2 标量双精度：与 ss 同形，操作数宽度由 xmm 寄存器自身决定，
+            // 所以完全可以共用这套 2/3 操作数处理（clsy 实测 mulsd 108、addsd 22、subsd 35、divsd 12）。
+            case Mnemonic.Addsd:
+            case Mnemonic.Subsd:
+            case Mnemonic.Mulsd:
+            case Mnemonic.Divsd:
                 {
                     // Addss and subss are just floating point add/sub, but we don't need to handle the stack stuff
                     // But we do need to handle 2 vs 3 operand forms
@@ -597,12 +603,25 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     else
                         goto default;
 
-                    if (instruction.Mnemonic == Mnemonic.Subss)
-                        Add(instruction.IP, ISIL.OpCode.Subtract, dest, src1, src2);
-                    else
-                        Add(instruction.IP, ISIL.OpCode.Add, dest, src1, src2);
+                    var arithmetic = instruction.Mnemonic switch
+                    {
+                        Mnemonic.Subss or Mnemonic.Subsd => ISIL.OpCode.Subtract,
+                        Mnemonic.Mulsd => ISIL.OpCode.Multiply,
+                        Mnemonic.Divsd => ISIL.OpCode.Divide,
+                        _ => ISIL.OpCode.Add,
+                    };
+
+                    Add(instruction.IP, arithmetic, dest, src1, src2);
                     break;
                 }
+            case Mnemonic.Movlpd: // 传送 double 的低 64 位，load / store 同构
+                {
+                    var dst = ConvertOperand(instruction, 0);
+                    var src = ConvertOperand(instruction, 1);
+                    Add(instruction.IP, ISIL.OpCode.Move, dst, src);
+                    break;
+                }
+
             // The following pair of instructions does not update the Carry Flag (CF):
             case Mnemonic.Dec:
                 Add(instruction.IP, ISIL.OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), Imm(1));
