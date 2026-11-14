@@ -364,6 +364,11 @@ public static class MetadataResolver
                 // Otherwise it may be one of the raisers, which throw the exception they are given
                 var raisedIndex = callInstruction.OpCode == OpCode.CallVoid ? 1 : 2;
 
+                // 诊断用（CPP2IL_TRACE_RAISER=1）：这里为什么没把调用改成 Throw。
+                // 只打印未知目标（TryGetValue 已失败）的那些，量可控。
+                if (ThrowHelperRecovery.TraceRaiser)
+                    Console.WriteLine($"[mres]\t{target:X}\tcount={callInstruction.Operands.Count}\tidx={raisedIndex}\top={callInstruction.OpCode}\tcaller={method.DeclaringType?.FullName}::{method.Name}");
+
                 if (callInstruction.Operands.Count > raisedIndex && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
                 {
                     var raised = callInstruction.Operands[raisedIndex];

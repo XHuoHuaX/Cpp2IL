@@ -27,13 +27,14 @@ public class X86InstructionSet : Cpp2IlInstructionSet
     {
         private static readonly X86CallingConventionResolver X86 = new();
 
+        // 唯一的开关判据。默认关闭：x86 分支机制上能跑，但下游消费不了栈槽参数（FINDING-047），
+        // 打开会把 clsy 的 clean 从 9222 打到 6276。保留代码、默认不启用，用 CPP2IL_X86_ABI=1 显式打开。
+        // 注意 RawRegisters 也必须走这一个判据，否则关着的时候行为就与改动前不一致。
+        private static bool X86AbiEnabled(ApplicationAnalysisContext app)
+            => app.Binary.is32Bit && System.Environment.GetEnvironmentVariable("CPP2IL_X86_ABI") == "1";
+
         private static BaseCallingConventionResolver For(ApplicationAnalysisContext app)
-            // 默认关闭：x86 分支在机制上能跑，但下游消费不了栈槽参数（见 FINDING-047），
-            // 打开会把 clsy 的 clean 从 9222 打到 6276。所以保留代码、默认不启用，
-            // 用 CPP2IL_X86_ABI=1 显式打开以便继续开发。
-            => app.Binary.is32Bit && System.Environment.GetEnvironmentVariable("CPP2IL_X86_ABI") == "1"
-                ? X86
-                : X64Conventions;
+            => X86AbiEnabled(app) ? X86 : X64Conventions;
 
         public override ISIL.Register ReturnRegister(MethodAnalysisContext ctx) => For(ctx.AppContext).ReturnRegister(ctx);
 
@@ -44,7 +45,10 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         public override ISIL.IOperand[] ResolveForManaged(MethodAnalysisContext ctx) => For(ctx.AppContext).ResolveForManaged(ctx);
 
         protected override (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app)
-            => app.Binary.is32Bit ? ([], []) : X64Conventions.RawRegistersFor(app);
+            // 必须与 For() 用同一个判据。否则 CPP2IL_X86_ABI 关着时，未知直调仍会拿空寄存器表，
+            // 导致 ResolveForUnmanaged 返回空、调用只剩 [target, ret] 两个操作数 ——
+            // 那就不是"与改动前一致"了（FINDING-048 §7.4）。
+            => X86AbiEnabled(app) ? ([], []) : X64Conventions.RawRegistersFor(app);
     }
 
     // 这个名字沿用原来的 CallingConventions：X86InstructionSet 里有十几处直接静态引用它

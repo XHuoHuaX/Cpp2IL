@@ -16,7 +16,7 @@ public static class ThrowHelperRecovery
     private const int MaxRaiserDepth = 3;
     private const int MaxStringLength = 64;
 
-    private static readonly bool TraceRaiser =
+    internal static readonly bool TraceRaiser =
         !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CPP2IL_TRACE_RAISER"));
 
     public static TypeAnalysisContext? GetThrownException(ApplicationAnalysisContext appContext, ulong address)
