@@ -201,13 +201,18 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
     public override (IReadOnlyList<ulong> DataReferences, IReadOnlyList<ulong> CallTargets) InspectPotentialThrowHelper(ApplicationAnalysisContext context, ulong address)
     {
+        // 诊断用（CPP2IL_TRACE_RAISER=1）：区分"解码抛异常"与"解码成功但没有 call"。
+        var trace = !string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_RAISER"));
+
         Iced.Intel.InstructionList body;
         try
         {
             body = X86Utils.GetMethodBodyAtVirtAddressNew(address, true, context);
         }
-        catch
+        catch (System.Exception ex)
         {
+            if (trace)
+                Console.WriteLine($"[throwinspect]\t{address:X}\tEXCEPTION\t{ex.GetType().Name}\t{ex.Message}");
             return ([], []);
         }
 
@@ -218,9 +223,15 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         {
             if (insn.Mnemonic == Mnemonic.Lea && insn.IsIPRelativeMemoryOperand)
                 dataReferences.Add(insn.IPRelativeMemoryAddress);
-            // 32 位解码器给的是 NearBranch32（见本文件 L160/L185 的同一写法）。\n            // 只认 NearBranch64 会让 callTargets 在 x86 上恒为空，进而使\n            // ThrowHelperRecovery.IsExceptionRaiser 恒为 false（FINDING-048）。\n            else if (insn.Mnemonic == Mnemonic.Call && insn.Op0Kind is OpKind.NearBranch16 or OpKind.NearBranch32 or OpKind.NearBranch64)
+            // 32 位解码器给的是 NearBranch32（见本文件 L160/L185 的同一写法）。
+            // 只认 NearBranch64 会让 callTargets 在 x86 上恒为空，进而使
+            // ThrowHelperRecovery.IsExceptionRaiser 恒为 false（FINDING-048）。
+            else if (insn.Mnemonic == Mnemonic.Call && insn.Op0Kind is OpKind.NearBranch16 or OpKind.NearBranch32 or OpKind.NearBranch64)
                 callTargets.Add(insn.NearBranchTarget);
         }
+
+        if (trace)
+            Console.WriteLine($"[throwinspect]\t{address:X}\tinsns={body.Count}\tdata={dataReferences.Count}\tcalls={callTargets.Count}");
 
         return (dataReferences, callTargets);
     }

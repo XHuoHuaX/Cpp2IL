@@ -16,6 +16,9 @@ public static class ThrowHelperRecovery
     private const int MaxRaiserDepth = 3;
     private const int MaxStringLength = 64;
 
+    private static readonly bool TraceRaiser =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CPP2IL_TRACE_RAISER"));
+
     public static TypeAnalysisContext? GetThrownException(ApplicationAnalysisContext appContext, ulong address)
     {
         var name = ResolveName(appContext, address, 0);
@@ -48,6 +51,11 @@ public static class ThrowHelperRecovery
 
         // and then check if we're calling it
         var result = nativeThrow != 0 && ReachesCall(appContext, address, nativeThrow, 0, []);
+
+        // 诊断用（CPP2IL_TRACE_RAISER=1）：把这条链上的三个中间量打出来。
+        // 断点到底在 raise、nativeThrow，还是 ReachesCall，一次就能看清，不用反汇编推理。
+        if (TraceRaiser)
+            Console.WriteLine($"[raiser]\t{address:X}\traise={raise:X}\tnativeThrow={nativeThrow:X}\tresult={result}");
 
         appContext.ExceptionRaisersByAddress[address] = result;
         return result;
