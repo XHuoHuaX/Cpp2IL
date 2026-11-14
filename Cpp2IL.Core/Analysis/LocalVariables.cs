@@ -98,6 +98,15 @@ public static class LocalVariables
         }
 
         method.Locals = locals.Select(kv => kv.Value).Concat(slotLocals.Values).ToList();
+
+        // 诊断用（CPP2IL_TRACE_SLOTMAP=1）：同一方法里把参数操作数和槽提升的键并排打出来，
+        // 好让"参数索引 → 帧槽"的对应关系被**读到**而不是推理出来（FINDING-049 §7.5）。
+        if (!string.IsNullOrEmpty(System.Environment.GetEnvironmentVariable("CPP2IL_TRACE_SLOTMAP")))
+        {
+            var paramText = string.Join(",", method.ParameterOperands.Select(o => o?.ToString() ?? "null"));
+            var slotText = string.Join(",", slotLocals.Select(kv => $"{kv.Key.Item1.Name}+{kv.Key.Item2:X}->{kv.Value.Name}"));
+            System.Console.WriteLine($"[slotmap]\t{method.DeclaringType?.FullName}::{method.Name}\tstatic={method.IsStatic}\tnparams={method.Parameters.Count}\tparams=[{paramText}]\tslots=[{slotText}]");
+        }
         // Return local names
         var retValIndex = 0;
         foreach (var instruction in instructions)
