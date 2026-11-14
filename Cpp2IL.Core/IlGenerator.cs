@@ -121,6 +121,19 @@ public static class IlGenerator
     }
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
     {
+        // 诊断用（CPP2IL_TRACE_METHOD=<方法名片段>）：把该方法的最终 ISIL 打出来。
+        // 用来回答"为什么某条指令缺失会让恢复变差"这类问题，比读代码推理直接（FINDING-050 §9）。
+        var traceMethod = Environment.GetEnvironmentVariable("CPP2IL_TRACE_METHOD");
+
+        if (!string.IsNullOrEmpty(traceMethod)
+            && $"{context.DeclaringType?.FullName}::{context.Name}".Contains(traceMethod, StringComparison.Ordinal))
+        {
+            Console.WriteLine($"[isil] ==== {context.DeclaringType?.FullName}::{context.Name} ====");
+
+            foreach (var instruction in context.ControlFlowGraph!.Blocks.SelectMany(b => b.Instructions))
+                Console.WriteLine($"[isil]   {instruction}");
+        }
+
         var assembly = context.DeclaringType!.DeclaringAssembly;
         var module = definition.DeclaringModule!;
         var factory = module.CorLibTypeFactory;
