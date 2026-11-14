@@ -62,9 +62,6 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
 
-    /// <summary>x87 栈顶寄存器：按指令的载荷宽度取 float / double 两个不同身份。</summary>
-    private static ISIL.Register X87Top(Instruction instruction)
-        => new(null, instruction.MemorySize.GetInfo().Size == 8 ? "st0_q" : "st0");
     private static ISIL.Immediate Imm(long value) => new(value);
     private static ISIL.Immediate Imm(ulong value) => new(unchecked((long)value));
 
@@ -759,39 +756,6 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 }
 
                 break;
-            // ---- x87 载入/写出 ----
-            // clsy 实测：fstp dword 469 / qword 281、fld dword 316 / qword 196、fldz 38、fld1 17
-            // （FINDING-050 普查）。这里只处理**内存形态**，其余形态保持未实现 —— 宁可留洞，不猜语义。
-            // 宽度决定寄存器名：float 用 st0、double 用 st0_q，由 LocalVariables 分别贴 Single/Double。
-            // ponytail: 同一个方法里混用 dword 与 qword 的 x87 序列会丢掉值的流动（两个名字当两个槽）。
-            //           实测样本里这种序列未出现；真出现时按不通处理即可，不会产出静默错值以外的东西。
-            case Mnemonic.Fld:
-                if (instruction.Op0Kind == OpKind.Memory)
-                {
-                    Add(instruction.IP, ISIL.OpCode.Move, X87Top(instruction), ConvertOperand(instruction, 0));
-                    break;
-                }
-
-                goto default;
-
-            case Mnemonic.Fstp:
-                if (instruction.Op0Kind == OpKind.Memory)
-                {
-                    Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), X87Top(instruction));
-                    break;
-                }
-
-                // `fstp st(0)` 只是弹出栈顶，对取值没有影响
-                break;
-
-            case Mnemonic.Fldz:
-                Add(instruction.IP, ISIL.OpCode.Move, new ISIL.Register(null, "st0"), Imm(0));
-                break;
-
-            case Mnemonic.Fld1:
-                Add(instruction.IP, ISIL.OpCode.Move, new ISIL.Register(null, "st0"), Imm(0x3F800000));
-                break;
-
             case Mnemonic.Test:
                 if (instruction.Op0Kind == OpKind.Register && instruction.Op1Kind == OpKind.Register && instruction.Op0Register == instruction.Op1Register)
                 {
