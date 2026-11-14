@@ -103,6 +103,8 @@ public static class LocalVariables
         // 把这些槽贴上元数据里已知的类型，`slot_X + 字段偏移` 才可能被当成成员访问；
         // 否则一律落进 "Unmanaged memory load"（clsy 26,095 处，占 placeholder 的 53%）。
         // 这就是"让 x86 的栈参数真正挂到调用点上"——参数的身份靠 ABI 偏移确定（FINDING-049 §8）。
+        LocalVariable? abiThisSlot = null;
+
         // 只作用于 32 位（x86 cdecl）；ARM64/x64 的路径完全不受影响。
         if (method.AppContext.Binary.is32Bit)
         {
@@ -132,6 +134,7 @@ public static class LocalVariables
             if (!method.IsStatic)
             {
                 TypeSlot(cursor, method.DeclaringType);
+                abiThisSlot = slotLocals.FirstOrDefault(kv => kv.Key.Item2 == cursor).Value;
                 cursor += 4;
             }
 
@@ -189,6 +192,14 @@ public static class LocalVariables
                 thisLocal.Name = "this";
                 thisLocal.IsThis = true;
                 paramLocals.Add(thisLocal);
+            }
+            else if (abiThisSlot is { } abiThis)
+            {
+                // x86 cdecl：this 就住在 [ebp+8]，靠 ABI 偏移直接认定，
+                // 不需要与 ParameterOperands（默认是 x64 寄存器名）匹配（FINDING-049 §9）。
+                abiThis.Name = "this";
+                abiThis.IsThis = true;
+                paramLocals.Add(abiThis);
             }
             else
             {
