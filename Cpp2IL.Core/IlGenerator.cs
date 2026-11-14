@@ -1034,6 +1034,9 @@ public static class IlGenerator
     /// decides whether any disambiguation rule can work at all. A set that shares machine code differs in
     /// parameter types, not arity; a set that differs in arity is a different problem.
     /// </summary>
+    private static readonly bool TraceUnmanagedLoad =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CPP2IL_TRACE_UML"));
+
     private static void ProbeAmbiguousCall(MethodAnalysisContext context, ulong address)
     {
         if (!AmbiguousCallProbeEnabled || !context.AppContext.MethodsByAddress.TryGetValue(address, out var candidates))
@@ -1319,6 +1322,16 @@ public static class IlGenerator
                             : new CilInstruction(CilOpCodes.Ldind_Ref));
                     break;
                 }
+                // 诊断用（CPP2IL_TRACE_UML=1）：把落到"原始内存"这一支的操作数结构打出来。
+                // 之前靠推理读错了 Base/Index 的顺序，改成直接看字段（FINDING-049 §6）。
+                if (TraceUnmanagedLoad)
+                {
+                    string Desc(IOperand? op) => op == null
+                        ? "null"
+                        : $"{op.GetType().Name}({op})";
+                    Console.WriteLine($"[uml]\tbase={Desc(memory.Base)}\tindex={Desc(memory.Index)}\taddend={memory.Addend}\tscale={memory.Scale}");
+                }
+
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);
