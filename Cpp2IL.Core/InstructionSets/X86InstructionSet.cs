@@ -44,6 +44,11 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
         public override ISIL.IOperand[] ResolveForManaged(MethodAnalysisContext ctx) => For(ctx.AppContext).ResolveForManaged(ctx);
 
+        // 不走 X86AbiEnabled：32 位二进制就是栈传参，这是事实而不是特性开关。
+        // 关着开关时其余部分仍按 x64 建模，但"第一个参数在哪"必须如实回答，
+        // 否则调用方（异常抛出改写）会拿到 rcx 这种 x86 上不存在的寄存器。
+        public override bool ArgumentsOnStack(ApplicationAnalysisContext app) => app.Binary.is32Bit;
+
         protected override (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app)
             // 必须与 For() 用同一个判据。否则 CPP2IL_X86_ABI 关着时，未知直调仍会拿空寄存器表，
             // 导致 ResolveForUnmanaged 返回空、调用只剩 [target, ret] 两个操作数 ——

@@ -52,6 +52,9 @@ public class X86CallingConventionResolver : BaseCallingConventionResolver
     // 也让 HasRawArgumentLayout 对带参数的真实调用不成立，从而不会去 remap 寄存器名。
     protected override (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app) => ([], []);
 
+    // 这是 ABI 事实，不是特性开关：x86 的参数一律在栈上。
+    public override bool ArgumentsOnStack(ApplicationAnalysisContext app) => true;
+
     public override IOperand[] ResolveForManaged(MethodAnalysisContext ctx)
     {
         List<IOperand> args = new();

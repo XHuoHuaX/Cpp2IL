@@ -44,6 +44,13 @@ public abstract class BaseCallingConventionResolver
     // false when the return buffer pointer lives outside the argument registers (e.g. arm64 uses x8)
     protected virtual bool HiddenBufferConsumesArgumentSlot => true;
 
+    /// <summary>
+    /// 参数是否全部走栈（x86 cdecl）。寄存器 ABI 上"第一个参数"就是第一个参数寄存器，
+    /// 可以直接读操作数；栈 ABI 上不行 —— 参数在内存里，操作数里根本没有它。
+    /// 调用方（如异常抛出改写）需要据此决定去哪取参数。
+    /// </summary>
+    public virtual bool ArgumentsOnStack(ApplicationAnalysisContext app) => false;
+
     public IOperand[] ResolveForUnmanaged(ApplicationAnalysisContext app, ulong target)
     {
         // We don't know the callee's signature, so preserve every argument register.

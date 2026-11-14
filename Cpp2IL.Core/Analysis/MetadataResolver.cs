@@ -363,18 +363,25 @@ public static class MetadataResolver
 
                 // Otherwise it may be one of the raisers, which throw the exception they are given
                 var raisedIndex = callInstruction.OpCode == OpCode.CallVoid ? 1 : 2;
+                var conventions = method.AppContext.InstructionSet.CallingConventionResolver;
+
+                // 栈 ABI 上两个来源都不可用：Operands[raisedIndex] 是 x86 上不存在的寄存器（实测 emit 成
+                // ldarg.0 -> throw this），直接塞 StackOffset(0) 又会被解析成 ldnull -> throw null。
+                // 两者都是"编得过但行为假"，所以这里**不转换**，留在 placeholder（诚实的洞）。
+                // 前提是栈槽先成为真正的局部变量（STAGES 2.4b*），届时再打开。
+                IOperand? raisedOperand = null;
+                if (conventions?.ArgumentsOnStack(method.AppContext) != true && callInstruction.Operands.Count > raisedIndex)
+                    raisedOperand = callInstruction.Operands[raisedIndex];
 
                 // 诊断用（CPP2IL_TRACE_RAISER=1）：这里为什么没把调用改成 Throw。
                 // 只打印未知目标（TryGetValue 已失败）的那些，量可控。
                 if (ThrowHelperRecovery.TraceRaiser)
-                    Console.WriteLine($"[mres]\t{target:X}\tcount={callInstruction.Operands.Count}\tidx={raisedIndex}\top={callInstruction.OpCode}\tcaller={method.DeclaringType?.FullName}::{method.Name}");
+                    Console.WriteLine($"[mres]\t{target:X}\tcount={callInstruction.Operands.Count}\tidx={raisedIndex}\top={callInstruction.OpCode}\tstack={conventions?.ArgumentsOnStack(method.AppContext)}\tcaller={method.DeclaringType?.FullName}::{method.Name}");
 
-                if (callInstruction.Operands.Count > raisedIndex && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
+                if (raisedOperand != null && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
                 {
-                    var raised = callInstruction.Operands[raisedIndex];
-
                     callInstruction.OpCode = OpCode.Throw;
-                    callInstruction.SetOperands(raised);
+                    callInstruction.SetOperands(raisedOperand);
                 }
 
                 continue;
